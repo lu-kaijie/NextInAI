@@ -1,0 +1,4 @@
+"""Deprecated Alembic placeholder.
+
+一期采用本地文件存储，不启用迁移系统。
+"""

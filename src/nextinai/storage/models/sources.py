@@ -1,0 +1,1 @@
+"""Deprecated database model placeholder."""
