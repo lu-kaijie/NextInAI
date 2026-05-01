@@ -13,6 +13,7 @@ from nextinai.harness.tools import DeliveryTaskStore
 from nextinai.services.notification_service import AgenticNotificationService
 from nextinai.storage.files import FileStorage, ensure_workspace
 from nextinai.core.config import get_settings
+from nextinai.core.logging import get_logger, log_error, log_event
 
 
 def _build_storage() -> FileStorage:
@@ -50,6 +51,7 @@ class DeliveryTaskScheduler:
         self.storage = storage or _build_storage()
         self.notification_service = notification_service or AgenticNotificationService(storage=self.storage)
         self.task_store = task_store or DeliveryTaskStore(self.storage)
+        self.logger = get_logger("scheduler")
 
     def list_tasks(self) -> list[dict[str, Any]]:
         return self.task_store.list_tasks()
@@ -58,11 +60,20 @@ class DeliveryTaskScheduler:
         now = now or datetime.now(timezone.utc)
         results: list[TaskRunResult] = []
         run_id = str(uuid4())
+        log_event(self.logger, "开始扫描到期任务", run_id=run_id, force=force)
         for task in self.task_store.list_tasks():
             if not task.get("enabled", True):
                 continue
             if not force and not self._is_due(task, now):
                 continue
+            log_event(
+                self.logger,
+                "开始执行任务",
+                run_id=run_id,
+                task_id=task["task_id"],
+                channel=task["channel"],
+                scope=task.get("scope", "daily"),
+            )
             try:
                 detail = self.notification_service.send(
                     channel=task["channel"],
@@ -75,10 +86,13 @@ class DeliveryTaskScheduler:
                 status = "suppressed" if "通知已抑制" in detail else "success"
                 self._mark_task_run(task["task_id"], now, status=status)
                 results.append(TaskRunResult(task_id=task["task_id"], status=status, detail=detail))
+                log_event(self.logger, "任务执行完成", run_id=run_id, task_id=task["task_id"], status=status)
             except Exception as exc:
                 self._mark_task_run(task["task_id"], now, status="failed", error=str(exc))
                 results.append(TaskRunResult(task_id=task["task_id"], status="failed", detail=str(exc)))
+                log_error(self.logger, "任务执行失败", run_id=run_id, task_id=task["task_id"], error=exc)
         self._record_scheduler_run(run_id=run_id, now=now, force=force, results=results)
+        log_event(self.logger, "任务扫描结束", run_id=run_id, executed=len(results))
         return results
 
     def run_loop(
@@ -95,6 +109,7 @@ class DeliveryTaskScheduler:
         suppressed_count = 0
         while True:
             cycles += 1
+            log_event(self.logger, "守护循环开始", cycle=cycles, force_first_cycle=force_first_cycle and cycles == 1)
             results = self.run_due_tasks(force=force_first_cycle and cycles == 1)
             executed_tasks += len(results)
             success_count += sum(1 for item in results if item.status == "success")
@@ -103,6 +118,15 @@ class DeliveryTaskScheduler:
             if max_cycles is not None and cycles >= max_cycles:
                 break
             time.sleep(max(1, poll_seconds))
+        log_event(
+            self.logger,
+            "守护循环结束",
+            cycles=cycles,
+            executed_tasks=executed_tasks,
+            success=success_count,
+            failed=failed_count,
+            suppressed=suppressed_count,
+        )
         return DaemonRunStats(
             cycles=cycles,
             executed_tasks=executed_tasks,

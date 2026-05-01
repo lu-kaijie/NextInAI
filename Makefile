@@ -1,4 +1,4 @@
-.PHONY: install-dev lint test run init-storage
+.PHONY: install-dev lint test run init-storage web
 
 install-dev:
 	pip install -e ".[dev]"
@@ -14,3 +14,6 @@ run:
 
 init-storage:
 	nextinai system init-storage
+
+web:
+	nextinai web

@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from nextinai.core.config import get_settings
+from nextinai.core.logging import get_logger, log_error, log_event
 from nextinai.harness.models import AssistantResponse, RunContext, SessionState
 from nextinai.harness.runtime import ExecutionEngine, FileSessionStateStore
 from nextinai.harness.tools import build_harness_tool_registry
@@ -35,6 +36,14 @@ class IntentDecision:
     requires_confirmation: bool = False
 
 
+class ReferenceResolutionError(ValueError):
+    """Raised when the user is clearly referring to prior context but resolution fails."""
+
+
+class UnsupportedTimeWindowError(ValueError):
+    """Raised when the user asks for a time window the current backend does not truly support."""
+
+
 class AssistantAgent:
     """A controlled agent that routes natural language to harness tools."""
 
@@ -46,6 +55,7 @@ class AssistantAgent:
         execution_engine: ExecutionEngine | None = None,
         session_store: FileSessionStateStore | None = None,
     ) -> None:
+        self.logger = get_logger("assistant")
         self.storage = storage or _build_storage()
         self.services = service_registry or build_service_registry()
         self.tool_registry = build_harness_tool_registry(
@@ -69,11 +79,28 @@ class AssistantAgent:
         text = message.strip()
         session_id = session_id or f"chat-{uuid4()}"
         state = self.session_store.load(session_id)
+        log_event(self.logger, "收到用户消息", session_id=session_id, actor_id=actor_id, user_message=text)
 
         if self._is_confirmation_message(text):
+            log_event(self.logger, "进入确认流", session_id=session_id)
             return self._handle_confirmation(text, state, actor_id=actor_id)
 
-        decision = self._decide_intent(text, state)
+        try:
+            decision = self._decide_intent(text, state)
+        except ReferenceResolutionError as exc:
+            log_error(self.logger, "引用解析失败", session_id=session_id, error=exc)
+            return AssistantResponse(message=str(exc))
+        except UnsupportedTimeWindowError as exc:
+            log_error(self.logger, "时间窗口不支持", session_id=session_id, error=exc)
+            return AssistantResponse(message=str(exc))
+        log_event(
+            self.logger,
+            "完成意图判定",
+            session_id=session_id,
+            intent=decision.intent,
+            tool=decision.tool_name,
+            requires_confirmation=decision.requires_confirmation,
+        )
         context = RunContext.create(
             trigger_type="chat",
             session_id=session_id,
@@ -93,6 +120,13 @@ class AssistantAgent:
         response = self._build_response(decision, result.output, state)
         self._update_session_state(state, decision, response, result.output)
         self.session_store.save(state)
+        log_event(
+            self.logger,
+            "完成消息响应",
+            session_id=session_id,
+            tool=decision.tool_name,
+            pending_confirmation=response.pending_confirmation,
+        )
         return response
 
     def _handle_confirmation(
@@ -109,6 +143,7 @@ class AssistantAgent:
             state.pending_tool_name = None
             state.pending_tool_input = None
             self.session_store.save(state)
+            log_event(self.logger, "用户取消待执行动作", session_id=state.session_id)
             return AssistantResponse(message="已取消待执行动作。")
 
         context = RunContext.create(
@@ -127,6 +162,7 @@ class AssistantAgent:
             confirmed=True,
             user_input=text,
         )
+        executed_tool_name = state.pending_tool_name
         message = result.output.get("message")
         if not message and "task" in result.output:
             task = result.output["task"]
@@ -141,6 +177,12 @@ class AssistantAgent:
         state.pending_tool_input = None
         state.updated_at = context.created_at
         self.session_store.save(state)
+        log_event(
+            self.logger,
+            "确认动作已执行",
+            session_id=state.session_id,
+            tool=executed_tool_name,
+        )
         return AssistantResponse(message=message or "动作已执行。", raw_outputs=result.output)
 
     def _decide_intent(self, text: str, state: SessionState) -> IntentDecision:
@@ -202,6 +244,9 @@ class AssistantAgent:
                     tool_name="get_event_detail",
                     tool_input={"event_id": ref.value},
                 )
+            raise ReferenceResolutionError(
+                "我知道你是在追问上一轮结果，但这次没有成功定位到具体对象。你可以说“第 3 个详细讲讲”或先重新列一次结果。"
+            )
 
         if "报告" in text or "news" in normalized or "openai" in normalized or "anthropic" in normalized:
             return IntentDecision(
@@ -209,7 +254,7 @@ class AssistantAgent:
                 tool_name="get_report_events",
                 tool_input={"limit": self._extract_limit(text) or 5},
             )
-        if any(keyword in normalized for keyword in ["热门", "最火", "trending", "排行榜", "上榜"]):
+        if any(keyword in normalized for keyword in ["热门", "最火", "trending", "排行榜", "上榜", "增长最快", "star增长"]):
             return IntentDecision(
                 intent="query_intelligence",
                 tool_name="get_trending_events",
@@ -231,7 +276,7 @@ class AssistantAgent:
     @staticmethod
     def _looks_like_detail_request(normalized: str) -> bool:
         return bool(
-            re.search(r"第\s*\d+\s*个", normalized)
+            re.search(r"第\s*(\d+|[一二三四五六七八九十两]+)\s*个", normalized)
             or any(keyword in normalized for keyword in ["详细", "展开", "继续讲", "继续说", "刚才那篇", "那份简报"])
         )
 
@@ -414,9 +459,8 @@ class AssistantAgent:
         return {"channel": channel, "target": "default", "scope": "daily", "view": view, "schedule": schedule}
 
     def _resolve_reference(self, text: str, state: SessionState) -> ResolvedReference | None:
-        match = re.search(r"第\s*(\d+)\s*个", text)
-        if match:
-            index = match.group(1)
+        index = self._extract_reference_index(text)
+        if index is not None:
             event_id = state.reference_map.get(index)
             if event_id:
                 return ResolvedReference(kind="event", value=event_id)
@@ -427,21 +471,69 @@ class AssistantAgent:
         return None
 
     def _resolve_task_reference(self, text: str, state: SessionState) -> str:
-        match = re.search(r"第\s*(\d+)\s*个?任务", text)
-        if match:
-            task_id = state.reference_map.get(match.group(1))
+        index = self._extract_reference_index(text, suffix="任务")
+        if index is not None:
+            task_id = state.reference_map.get(index)
             if task_id:
                 return task_id
         raise ValueError("没有识别到要删除的任务，请先查看任务列表后再说“删除第 N 个任务”。")
 
     @staticmethod
+    def _extract_reference_index(text: str, suffix: str = "个") -> str | None:
+        if suffix == "个":
+            pattern = r"第\s*(\d+|[一二三四五六七八九十两]+)\s*个"
+        else:
+            pattern = rf"第\s*(\d+|[一二三四五六七八九十两]+)\s*(个)?\s*{suffix}"
+        match = re.search(pattern, text)
+        if not match:
+            return None
+        token = match.group(1)
+        if token.isdigit():
+            return token
+        chinese_map = {
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+            "十": 10,
+        }
+        if token == "十":
+            return "10"
+        if token.startswith("十") and len(token) == 2:
+            return str(10 + chinese_map.get(token[1], 0))
+        if token.endswith("十") and len(token) == 2:
+            return str(chinese_map.get(token[0], 0) * 10)
+        if "十" in token and len(token) == 3:
+            return str(chinese_map.get(token[0], 0) * 10 + chinese_map.get(token[2], 0))
+        return str(chinese_map.get(token, 0)) if token in chinese_map else None
+
+    @staticmethod
     def _extract_window(text: str) -> str:
         lowered = text.lower()
+        if AssistantAgent._mentions_unsupported_trending_window(text):
+            raise UnsupportedTimeWindowError(
+                "当前热门榜能力只稳定支持 daily、7d 和 30d。你刚才说的是“两个月/60天”这类更长时间窗，我现在不能准确按这个口径给你排行。你可以改问“最近30天最火的项目”或“最近7天 star 增长最快的项目”。"
+            )
         if any(keyword in lowered for keyword in ["weekly", "7d", "这周", "最近七天"]):
             return "7d"
-        if any(keyword in lowered for keyword in ["monthly", "30d", "这个月", "最近三十天"]):
+        if any(keyword in lowered for keyword in ["monthly", "30d", "这个月", "最近三十天", "最近30天", "最近一个月", "一个月"]):
             return "30d"
         return "daily"
+
+    @staticmethod
+    def _mentions_unsupported_trending_window(text: str) -> bool:
+        normalized = text.lower().replace(" ", "")
+        if any(keyword in normalized for keyword in ["两个月", "2个月", "两月", "2月", "最近两个月", "最近两月"]):
+            return True
+        if any(keyword in normalized for keyword in ["60天", "最近60天", "六十天", "最近六十天"]):
+            return True
+        return False
 
     @staticmethod
     def _extract_hours(text: str) -> int | None:

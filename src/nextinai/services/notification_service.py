@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from nextinai.core.config import get_settings
 from nextinai.core.datetime_utils import parse_datetime
+from nextinai.core.logging import get_logger, log_event
 from nextinai.domain.enums import DeliveryChannel, DeliveryStatus
 from nextinai.notifiers.adapters import EmailNotificationAdapter, NotificationAdapter, WebhookNotificationAdapter
 from nextinai.notifiers.models import DeliveryResult, NotificationMessage, NotificationTarget
@@ -40,6 +41,7 @@ class AgenticNotificationService(NotificationService):
         adapters: dict[DeliveryChannel, NotificationAdapter] | None = None,
     ) -> None:
         self.settings = get_settings()
+        self.logger = get_logger("notification")
         self.storage = storage or _build_storage()
         self.digest_service = digest_service or AgenticDigestService(storage=self.storage)
         self.adapters = adapters or {
@@ -58,6 +60,17 @@ class AgenticNotificationService(NotificationService):
         report_title: str | None = None,
         target: str | None = None,
     ) -> str:
+        log_event(
+            self.logger,
+            "开始发送通知",
+            channel=channel,
+            content_kind=content_kind,
+            scope=scope,
+            briefing_view=briefing_view,
+            suppress_duplicates=suppress_duplicates,
+            report_title=report_title,
+            target=target,
+        )
         request = NotificationDispatchRequest(
             channel=channel,
             content_kind=content_kind,
@@ -73,6 +86,7 @@ class AgenticNotificationService(NotificationService):
         content = self._build_content(request)
         if request.suppress_duplicates and self._should_suppress(content, notification_target, request):
             self._record_suppressed_delivery(request, content, notification_target)
+            log_event(self.logger, "通知被抑制", channel=channel_enum.value, target=notification_target.destination)
             return (
                 f"{channel_enum.value} 通知已抑制：目标={notification_target.destination}，"
                 f"内容={content.message.title}"
@@ -80,6 +94,14 @@ class AgenticNotificationService(NotificationService):
         adapter = self.adapters[channel_enum]
         result = adapter.deliver(content.message, notification_target)
         self._record_delivery(request, content, notification_target, result)
+        log_event(
+            self.logger,
+            "通知发送完成",
+            channel=channel_enum.value,
+            target=notification_target.destination,
+            status=result.status.value,
+            title=content.message.title,
+        )
         return (
             f"{channel_enum.value} 通知已处理：状态={result.status.value}，"
             f"目标={notification_target.destination}，内容={content.message.title}"

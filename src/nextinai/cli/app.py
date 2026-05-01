@@ -1,6 +1,8 @@
 """Application CLI entrypoint."""
 
 from pathlib import Path
+import subprocess
+import sys
 from uuid import uuid4
 
 import typer
@@ -9,6 +11,7 @@ from rich.table import Table
 
 from nextinai.agents.assistant import AssistantAgent
 from nextinai.core.config import get_settings
+from nextinai.core.logging import configure_logging, get_log_path, tail_logs
 from nextinai.services.registry import build_service_registry
 from nextinai.storage.files import ensure_workspace
 
@@ -35,6 +38,7 @@ chat_session_holder = {"session_id": None}
 @app.callback()
 def main() -> None:
     """NextInAI CLI root."""
+    configure_logging()
 
 
 @system_app.command("show-config")
@@ -64,6 +68,19 @@ def init_storage(create_output_dir: bool = typer.Option(True, help="是否同时
     if create_output_dir:
         Path(settings.report_output_dir).mkdir(parents=True, exist_ok=True)
     console.print("[green]本地存储初始化完成。[/green]")
+
+
+@system_app.command("show-logs")
+def show_logs(lines: int = typer.Option(80, help="显示最近多少行日志。")) -> None:
+    """查看最近运行日志。"""
+
+    path = get_log_path()
+    rows = tail_logs(lines)
+    if not rows:
+        console.print(f"[yellow]当前还没有日志文件：{path}[/yellow]")
+        return
+    console.print(f"[cyan]日志文件：{path}[/cyan]")
+    console.print("\n".join(rows))
 
 
 @subscription_app.command("add")
@@ -254,6 +271,34 @@ def chat(
             break
         response = agent.respond(user_input, session_id=active_session_id)
         console.print(response.message)
+
+
+@app.command("web")
+def run_web(
+    port: int = typer.Option(8501, help="Streamlit 端口。"),
+    address: str = typer.Option("127.0.0.1", help="Streamlit 监听地址。"),
+) -> None:
+    """启动 Streamlit 前端。"""
+
+    try:
+        import streamlit  # noqa: F401
+    except ImportError as exc:
+        raise typer.BadParameter("当前环境未安装 streamlit，请先安装依赖。") from exc
+
+    from nextinai.web.streamlit_app import __file__ as streamlit_file
+
+    command = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(streamlit_file),
+        "--server.port",
+        str(port),
+        "--server.address",
+        address,
+    ]
+    raise SystemExit(subprocess.call(command))
 
 
 @task_app.command("list")

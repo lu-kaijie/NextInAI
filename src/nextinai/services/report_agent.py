@@ -8,6 +8,7 @@ from typing import Any
 from nextinai.agents import IntelligenceAgent, OpenAIIntelligenceAgent, RuleBasedIntelligenceAgent
 from nextinai.collectors.reports import DEFAULT_REPORT_SOURCES, CollectedReportItem, ReportSource, ReportSourceCollector
 from nextinai.core.config import get_settings
+from nextinai.core.logging import build_progress_callback, get_logger, log_error, log_event
 from nextinai.domain.enums import AnalysisKind, EventSignal, SourceKind
 from nextinai.services.contracts import ReportService
 from nextinai.storage.files import FileStorage, ensure_workspace
@@ -30,6 +31,7 @@ class AgenticReportService(ReportService):
         sources: list[ReportSource] | None = None,
     ) -> None:
         settings = get_settings()
+        self.logger = get_logger("reports")
         self.storage = storage or _build_storage()
         self.collector = collector or ReportSourceCollector()
         self.sources = sources or DEFAULT_REPORT_SOURCES
@@ -48,6 +50,8 @@ class AgenticReportService(ReportService):
         selected_sources = [source for source in self.sources if source.group == source_group]
         if not selected_sources:
             raise ValueError(f"未找到来源组：{source_group}")
+        progress = build_progress_callback(self.logger, progress_callback)
+        log_event(self.logger, "开始抓取报告来源组", source_group=source_group, source_count=len(selected_sources))
 
         content_items = self.storage.load_collection("content_items")
         analysis_results = self.storage.load_collection("analysis_results")
@@ -60,19 +64,17 @@ class AgenticReportService(ReportService):
         skipped = 0
         titles: list[str] = []
         for source in selected_sources:
-            if progress_callback is not None:
-                progress_callback(f"开始抓取来源：{source.name}")
+            progress(f"开始抓取来源：{source.name}")
             try:
-                items = self.collector.collect(source, progress_callback=progress_callback)
+                items = self.collector.collect(source, progress_callback=progress)
             except Exception as exc:
                 report_skips.append({"source": source.name, "reason": str(exc)})
                 skipped += 1
-                if progress_callback is not None:
-                    progress_callback(f"来源抓取失败：{source.name}，原因：{exc}")
+                log_error(self.logger, "来源抓取失败", source=source.name, error=exc)
+                progress(f"来源抓取失败：{source.name}，原因：{exc}")
                 continue
 
-            if progress_callback is not None:
-                progress_callback(f"来源抓取完成：{source.name}，获得 {len(items)} 篇候选文章")
+            progress(f"来源抓取完成：{source.name}，获得 {len(items)} 篇候选文章")
             for item in items:
                 fingerprint = self._build_fingerprint(item)
                 source_ref = f"report:{fingerprint}"
@@ -80,14 +82,12 @@ class AgenticReportService(ReportService):
                 if is_duplicate_content and source_ref in analysis_index:
                     report_skips.append({"source": source.name, "title": item.title, "reason": "duplicate"})
                     skipped += 1
-                    if progress_callback is not None:
-                        progress_callback(f"[{source.name}] 跳过重复文章：{item.title}")
+                    progress(f"[{source.name}] 跳过重复文章：{item.title}")
                     continue
                 if not item.summary_text and not item.body_text:
                     report_skips.append({"source": source.name, "title": item.title, "reason": "unreadable"})
                     skipped += 1
-                    if progress_callback is not None:
-                        progress_callback(f"[{source.name}] 跳过不可读文章：{item.title}")
+                    progress(f"[{source.name}] 跳过不可读文章：{item.title}")
                     continue
 
                 if not is_duplicate_content:
@@ -97,11 +97,9 @@ class AgenticReportService(ReportService):
                     titles.append(item.title)
 
                 if source_ref in analysis_index:
-                    if progress_callback is not None:
-                        progress_callback(f"[{source.name}] 已有解读，跳过：{item.title}")
+                    progress(f"[{source.name}] 已有解读，跳过：{item.title}")
                     continue
-                if progress_callback is not None:
-                    progress_callback(f"[{source.name}] 正在解读：{item.title}")
+                progress(f"[{source.name}] 正在解读：{item.title}")
                 interpretation = self.agent.interpret_report(
                     title=item.title,
                     source_name=item.source_name,
@@ -122,18 +120,26 @@ class AgenticReportService(ReportService):
                 )
                 analysis_index.add(source_ref)
                 interpreted += 1
-                if progress_callback is not None:
-                    progress_callback(f"[{source.name}] 解读完成：{item.title}")
+                progress(f"[{source.name}] 解读完成：{item.title}")
 
         self.storage.save_collection("content_items", content_items)
         self.storage.save_collection("analysis_results", analysis_results)
         self.storage.save_collection("report_skips", report_skips)
 
         titles_preview = "；".join(titles[:5]) if titles else "无新报告"
-        return (
+        summary = (
             f"报告采集完成：新增 {created} 条，解读 {interpreted} 条，跳过 {skipped} 条。"
             f"本轮重点：{titles_preview}"
         )
+        log_event(
+            self.logger,
+            "报告抓取完成",
+            source_group=source_group,
+            created=created,
+            interpreted=interpreted,
+            skipped=skipped,
+        )
+        return summary
 
     @staticmethod
     def _build_fingerprint(item: CollectedReportItem) -> str:

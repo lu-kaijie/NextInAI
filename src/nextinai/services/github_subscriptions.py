@@ -12,6 +12,7 @@ from nextinai.agents import IntelligenceAgent, OpenAIIntelligenceAgent, RuleBase
 from nextinai.collectors.github import GitHubCollectedItem, GitHubRepositoryCollector
 from nextinai.core.datetime_utils import parse_datetime
 from nextinai.core.config import get_settings
+from nextinai.core.logging import get_logger, log_error, log_event
 from nextinai.domain.enums import SourceKind
 from nextinai.services.contracts import SubscriptionRecord, SubscriptionService
 from nextinai.storage.files import FileStorage, ensure_workspace
@@ -45,6 +46,7 @@ class GitHubSubscriptionService(SubscriptionService):
         agent: IntelligenceAgent | None = None,
     ) -> None:
         settings = get_settings()
+        self.logger = get_logger("subscriptions")
         self.storage = storage or _build_storage()
         self.collector = collector or GitHubRepositoryCollector(token=settings.github_token)
         if agent is not None:
@@ -60,8 +62,16 @@ class GitHubSubscriptionService(SubscriptionService):
 
     def add_subscription(self, repository: str, lookback_hours: int, refresh_minutes: int) -> str:
         normalized = validate_repository(repository)
+        log_event(
+            self.logger,
+            "新增订阅请求",
+            repository=normalized,
+            lookback_hours=lookback_hours,
+            refresh_minutes=refresh_minutes,
+        )
         rows = self.storage.load_collection("subscriptions")
         if any(item["repository"] == normalized for item in rows):
+            log_event(self.logger, "订阅已存在，直接返回", repository=normalized)
             return normalized
 
         record = SubscriptionRecord(
@@ -77,6 +87,7 @@ class GitHubSubscriptionService(SubscriptionService):
             }
         )
         self.storage.save_collection("subscriptions", rows)
+        log_event(self.logger, "新增订阅完成", repository=normalized)
         return normalized
 
     def list_subscriptions(self) -> list[dict[str, int | str]]:
@@ -84,6 +95,7 @@ class GitHubSubscriptionService(SubscriptionService):
 
     def sync_subscriptions(self, repository: str | None = None) -> dict[str, int | list[str]]:
         subscriptions = self._resolve_subscriptions(repository)
+        log_event(self.logger, "开始同步订阅", repository=repository, subscription_count=len(subscriptions))
         synced: list[str] = []
         no_updates: list[str] = []
         failed: list[str] = []
@@ -96,11 +108,13 @@ class GitHubSubscriptionService(SubscriptionService):
             repo = subscription["repository"]
             checkpoint = self._get_checkpoint(checkpoints, repo)
             since = self._resolve_since(subscription, checkpoint)
+            log_event(self.logger, "开始同步单仓库", repository=repo, since=since.isoformat())
             try:
                 collected = self._collect_with_retry(repo, since)
             except Exception as exc:
                 self._mark_checkpoint_failure(checkpoints, checkpoint, str(exc))
                 failed.append(repo)
+                log_error(self.logger, "单仓库同步失败", repository=repo, error=exc)
                 continue
 
             new_items = self._append_content_items(content_items, content_index, repo, collected)
@@ -109,9 +123,24 @@ class GitHubSubscriptionService(SubscriptionService):
             if new_items == 0:
                 no_updates.append(repo)
             self._mark_checkpoint_success(checkpoints, checkpoint)
+            log_event(
+                self.logger,
+                "单仓库同步完成",
+                repository=repo,
+                collected=len(collected),
+                new_items=new_items,
+            )
 
         self.storage.save_collection("checkpoints", checkpoints)
         self.storage.save_collection("content_items", content_items)
+        log_event(
+            self.logger,
+            "订阅同步完成",
+            synced=len(synced),
+            no_updates=len(no_updates),
+            failed=len(failed),
+            new_items=created_items,
+        )
         return {
             "synced_repositories": synced,
             "no_update_repositories": no_updates,
@@ -121,6 +150,7 @@ class GitHubSubscriptionService(SubscriptionService):
 
     def summarize_repository(self, repository: str, hours: int = 24) -> str:
         normalized = validate_repository(repository)
+        log_event(self.logger, "开始生成仓库摘要", repository=normalized, hours=hours)
         window_start = datetime.now(timezone.utc) - timedelta(hours=hours)
         content_items = self.storage.load_collection("content_items")
         repo_items = [
@@ -128,11 +158,13 @@ class GitHubSubscriptionService(SubscriptionService):
             for item in content_items
             if item["source_key"] == normalized and self._is_in_window(item.get("published_at"), window_start)
         ]
-        return self.agent.summarize_repository_updates(
+        result = self.agent.summarize_repository_updates(
             repository=normalized,
             hours=hours,
             items=repo_items,
         )
+        log_event(self.logger, "仓库摘要完成", repository=normalized, item_count=len(repo_items))
+        return result
 
     def _resolve_subscriptions(self, repository: str | None) -> list[dict[str, Any]]:
         subscriptions = self.storage.load_collection("subscriptions")
@@ -202,11 +234,13 @@ class GitHubSubscriptionService(SubscriptionService):
 
     def _collect_with_retry(self, repository: str, since: datetime) -> list[GitHubCollectedItem]:
         last_error: Exception | None = None
-        for _attempt in range(3):
+        for attempt in range(1, 4):
             try:
+                log_event(self.logger, "抓取仓库更新", repository=repository, attempt=attempt)
                 return self.collector.collect_repository_updates(repository, since)
             except httpx.HTTPError as exc:
                 last_error = exc
+                log_error(self.logger, "抓取仓库更新失败，准备重试", repository=repository, attempt=attempt, error=exc)
         if last_error is not None:
             raise last_error
         return []

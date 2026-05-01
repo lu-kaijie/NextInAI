@@ -9,6 +9,7 @@ from pathlib import Path
 from nextinai.agents import DigestOverview, IntelligenceAgent, OpenAIIntelligenceAgent, RuleBasedIntelligenceAgent
 from nextinai.core.config import get_settings
 from nextinai.core.datetime_utils import parse_datetime
+from nextinai.core.logging import get_logger, log_event
 from nextinai.digests.exporters import DigestExporter
 from nextinai.digests.models import DigestDocument, DigestSection
 from nextinai.domain.enums import SourceKind
@@ -35,6 +36,7 @@ class AgenticDigestService(DigestService):
         subscription_service: GitHubSubscriptionService | None = None,
     ) -> None:
         settings = get_settings()
+        self.logger = get_logger("digest")
         self.storage = storage or _build_storage()
         if agent is not None:
             self.agent = agent
@@ -56,6 +58,7 @@ class AgenticDigestService(DigestService):
         self.report_output_dir = settings.report_output_dir
 
     def generate(self, scope: str) -> str:
+        log_event(self.logger, "开始生成简报", scope=scope)
         window_start = self._resolve_window_start(scope)
         event_briefing = self._build_event_briefing(scope, window_start, view="flash")
         repo_summaries = self._build_repo_summaries(window_start)
@@ -103,9 +106,18 @@ class AgenticDigestService(DigestService):
         )
         markdown = document.to_markdown()
         self._store_digest(scope, markdown, document)
+        log_event(
+            self.logger,
+            "简报生成完成",
+            scope=scope,
+            repo_sections=len(repo_summaries),
+            trending_sections=len(trending_entries),
+            report_sections=len(report_entries),
+        )
         return markdown
 
     def export(self, scope: str, formats: list[str]) -> dict[str, str]:
+        log_event(self.logger, "开始导出简报", scope=scope, formats=",".join(formats))
         digest = self._find_latest_digest(scope)
         if digest is None:
             markdown = self.generate(scope)
@@ -129,6 +141,7 @@ class AgenticDigestService(DigestService):
             exported["pdf"] = str(pdf_path)
             digest["pdf_path"] = str(pdf_path)
             self._persist_digest_update(digest)
+        log_event(self.logger, "简报导出完成", scope=scope, exported=",".join(exported.keys()))
         return exported
 
     @staticmethod

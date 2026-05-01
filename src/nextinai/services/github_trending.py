@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from nextinai.agents import IntelligenceAgent, OpenAIIntelligenceAgent, RuleBasedIntelligenceAgent
 from nextinai.collectors.trending import GitHubTrendingCollector, TrendingRepository
 from nextinai.core.config import get_settings
+from nextinai.core.logging import get_logger, log_event
 from nextinai.services.contracts import TrendingService
 
 
@@ -19,6 +20,7 @@ class GitHubTrendingService(TrendingService):
         agent: IntelligenceAgent | None = None,
     ) -> None:
         settings = get_settings()
+        self.logger = get_logger("trending")
         self.collector = collector or GitHubTrendingCollector(token=settings.github_token)
         if agent is not None:
             self.agent = agent
@@ -32,8 +34,10 @@ class GitHubTrendingService(TrendingService):
             self.agent = RuleBasedIntelligenceAgent()
 
     def get_trending(self, window: str, limit: int) -> str:
+        log_event(self.logger, "开始获取热门榜", window=window, limit=limit)
         repositories = self.collector.collect(window, limit)
         if not repositories:
+            log_event(self.logger, "热门榜为空", window=window, limit=limit)
             return f"在时间窗口 {window} 内没有获取到可用的热门仓库结果。"
 
         lines = [
@@ -44,6 +48,7 @@ class GitHubTrendingService(TrendingService):
         ]
         for index, repo in enumerate(repositories, start=1):
             lines.extend(self._format_repository(index, repo))
+        log_event(self.logger, "热门榜生成完成", window=window, count=len(repositories))
         return "\n".join(lines).strip()
 
     def _format_repository(self, index: int, repo: TrendingRepository) -> list[str]:

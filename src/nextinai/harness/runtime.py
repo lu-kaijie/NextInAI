@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from nextinai.harness.models import AgentRun, RunContext, SessionState, ToolCallRecord
+from nextinai.core.logging import get_logger, log_error, log_event
 from nextinai.storage.files import FileStorage
 
 
@@ -98,6 +99,7 @@ class ExecutionEngine:
     def __init__(self, *, tool_registry: ToolRegistry, storage: FileStorage) -> None:
         self.tool_registry = tool_registry
         self.storage = storage
+        self.logger = get_logger("execution")
 
     def execute_tool(
         self,
@@ -109,6 +111,14 @@ class ExecutionEngine:
         user_input: str | None = None,
     ) -> ExecutionResult:
         tool = self.tool_registry.get(tool_name)
+        log_event(
+            self.logger,
+            "准备执行工具",
+            run_id=context.run_id,
+            session_id=context.session_id,
+            tool=tool_name,
+            confirmed=confirmed,
+        )
         if context.allowed_tools and tool_name not in context.allowed_tools:
             raise PermissionError(f"当前上下文不允许执行工具：{tool_name}")
 
@@ -137,6 +147,7 @@ class ExecutionEngine:
             tool_call.finalize(output=output)
             agent_run.finalize(output_message="等待用户确认动作执行。")
             self.record_run(agent_run)
+            log_event(self.logger, "工具进入待确认状态", run_id=context.run_id, tool=tool_name)
             return ExecutionResult(output=output, tool_call=tool_call, agent_run=agent_run)
 
         try:
@@ -145,11 +156,13 @@ class ExecutionEngine:
             tool_call.finalize(error=str(exc))
             agent_run.finalize(error=str(exc))
             self.record_run(agent_run)
+            log_error(self.logger, "工具执行失败", run_id=context.run_id, tool=tool_name, error=exc)
             raise
 
         tool_call.finalize(output=output)
         agent_run.finalize(output_message=output.get("message"))
         self.record_run(agent_run)
+        log_event(self.logger, "工具执行完成", run_id=context.run_id, tool=tool_name)
         return ExecutionResult(output=output, tool_call=tool_call, agent_run=agent_run)
 
     def record_run(self, agent_run: AgentRun) -> None:
