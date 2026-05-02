@@ -66,7 +66,7 @@ def build_harness_tool_registry(
         QueryEventsTool(
             name="get_trending_events",
             description="查询 GitHub 热门榜并返回结构化热门事件。",
-            input_schema={"window": "daily|7d|30d", "limit": "int"},
+            input_schema={"window": "daily|7d|30d", "limit": "optional int"},
             output_schema={"events": "list"},
             handler=lambda payload: {"events": capability.get_trending_events(payload["window"], payload.get("limit", 10))},
         )
@@ -75,7 +75,7 @@ def build_harness_tool_registry(
         QueryEventsTool(
             name="get_repo_update_events",
             description="查询已采集仓库在指定窗口内的更新事件。",
-            input_schema={"repository": "owner/name", "hours": "int"},
+            input_schema={"repository": "owner/name", "hours": "optional int"},
             output_schema={"events": "list"},
             handler=lambda payload: {
                 "events": capability.get_repo_update_events(payload["repository"], payload.get("hours", 24))
@@ -86,7 +86,7 @@ def build_harness_tool_registry(
         QueryEventsTool(
             name="get_report_events",
             description="查询已采集 AI 公司/论坛报告的解读事件。",
-            input_schema={"source_name": "optional str", "limit": "int"},
+            input_schema={"source_name": "optional str", "limit": "optional int"},
             output_schema={"events": "list"},
             handler=lambda payload: {
                 "events": capability.get_report_events(
@@ -133,7 +133,7 @@ def build_harness_tool_registry(
         QueryEventsTool(
             name="generate_briefing",
             description="根据传入事件集合生成快讯版简报对象。",
-            input_schema={"scope": "str", "view": "flash|deep|conversation", "events": "list"},
+            input_schema={"scope": "str", "view": "optional flash|deep|conversation", "events": "list"},
             output_schema={"briefing": "dict"},
             handler=lambda payload: {
                 "briefing": briefing_builder.build_briefing(
@@ -148,7 +148,7 @@ def build_harness_tool_registry(
         QueryEventsTool(
             name="render_briefing_preview",
             description="根据事件查询结果直接生成 Markdown 快览。",
-            input_schema={"scope": "str", "view": "flash|deep|conversation", "events": "list"},
+            input_schema={"scope": "optional str", "view": "optional flash|deep|conversation", "events": "list"},
             output_schema={"markdown": "str"},
             handler=lambda payload: {
                 "markdown": capability.render_briefing_preview(
@@ -163,7 +163,7 @@ def build_harness_tool_registry(
         ActionTool(
             name="deliver_briefing",
             description="通过通知服务发送简报。",
-            input_schema={"channel": "email|webhook", "scope": "str", "target": "optional str"},
+            input_schema={"channel": "email|webhook", "scope": "optional str", "target": "optional str"},
             output_schema={"message": "str"},
             handler=lambda payload: {
                 "message": capability.send_notification(
@@ -179,7 +179,7 @@ def build_harness_tool_registry(
         ActionTool(
             name="add_subscription",
             description="新增一个 GitHub 仓库订阅。",
-            input_schema={"repository": "owner/name", "lookback_hours": "int", "refresh_minutes": "int"},
+            input_schema={"repository": "owner/name", "lookback_hours": "optional int", "refresh_minutes": "optional int"},
             output_schema={"repository": "str"},
             handler=lambda payload: {
                 "repository": capability.add_subscription(
@@ -194,7 +194,13 @@ def build_harness_tool_registry(
         ActionTool(
             name="create_delivery_task",
             description="创建一个本地定时推送任务记录。",
-            input_schema={"channel": "email|webhook", "target": "str", "scope": "str", "view": "str", "schedule": "str"},
+            input_schema={
+                "channel": "email|webhook",
+                "target": "optional str",
+                "scope": "optional str",
+                "view": "optional flash|deep|conversation",
+                "schedule": "optional hourly|daily|weekly",
+            },
             output_schema={"task": "dict"},
             handler=lambda payload: {
                 "task": capability.create_delivery_task(
@@ -220,7 +226,7 @@ def build_harness_tool_registry(
         ActionTool(
             name="export_repository_summary",
             description="导出单仓库更新摘要。",
-            input_schema={"repository": "owner/name", "hours": "int", "formats": "list[str]"},
+            input_schema={"repository": "owner/name", "hours": "optional int", "formats": "list[md|pdf]"},
             output_schema={"exports": "dict"},
             requires_confirmation=False,
             handler=lambda payload: {
@@ -236,7 +242,7 @@ def build_harness_tool_registry(
         ActionTool(
             name="export_trending",
             description="导出热门榜分析结果。",
-            input_schema={"window": "str", "limit": "int", "formats": "list[str]"},
+            input_schema={"window": "daily|7d|30d", "limit": "optional int", "formats": "list[md|pdf]"},
             output_schema={"exports": "dict"},
             requires_confirmation=False,
             handler=lambda payload: {
@@ -252,7 +258,7 @@ def build_harness_tool_registry(
         ActionTool(
             name="export_report",
             description="导出单条报告详细解读。",
-            input_schema={"report_id": "str", "formats": "list[str]"},
+            input_schema={"report_id": "str", "formats": "list[md|pdf]"},
             output_schema={"exports": "dict"},
             requires_confirmation=False,
             handler=lambda payload: {
@@ -267,7 +273,7 @@ def build_harness_tool_registry(
         ActionTool(
             name="export_report_summary",
             description="导出报告摘要列表。",
-            input_schema={"source_name": "optional str", "limit": "int", "formats": "list[str]"},
+            input_schema={"source_name": "optional str", "limit": "optional int", "formats": "list[md|pdf]"},
             output_schema={"exports": "dict"},
             requires_confirmation=False,
             handler=lambda payload: {
@@ -283,7 +289,7 @@ def build_harness_tool_registry(
         ActionTool(
             name="export_digest",
             description="导出简报或 briefing。",
-            input_schema={"scope": "str", "formats": "list[str]"},
+            input_schema={"scope": "optional str", "formats": "list[md|pdf]"},
             output_schema={"exports": "dict"},
             requires_confirmation=False,
             handler=lambda payload: {

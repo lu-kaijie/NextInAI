@@ -10,7 +10,6 @@ from uuid import uuid4
 
 from openai import OpenAI
 
-from nextinai.collectors.reports import DEFAULT_REPORT_SOURCES
 from nextinai.core.config import get_settings
 from nextinai.core.logging import get_logger, log_error, log_event
 from nextinai.harness.models import AssistantResponse, RunContext, SessionState
@@ -31,12 +30,6 @@ def _build_service_registry_for_storage(storage: FileStorage) -> ServiceRegistry
 
 
 @dataclass(slots=True)
-class ResolvedReference:
-    kind: str
-    value: str
-
-
-@dataclass(slots=True)
 class IntentDecision:
     intent: str
     tool_name: str
@@ -46,10 +39,6 @@ class IntentDecision:
 
 class ReferenceResolutionError(ValueError):
     """Raised when the user is clearly referring to prior context but resolution fails."""
-
-
-class UnsupportedTimeWindowError(ValueError):
-    """Raised when the user asks for a time window the current backend does not truly support."""
 
 
 class IntentPlanner:
@@ -69,6 +58,7 @@ class OpenAIIntentPlanner(IntentPlanner):
             "你是 NextInAI 的受控 agent。"
             "你的职责是根据用户目标、会话上下文和工具结果，决定下一步是否调用工具。"
             "不要依赖关键词匹配思维，不要假装已经完成未执行的动作。"
+            "你必须显式给出工具参数，不能把时间窗口、导出格式、仓库名、报告来源之类参数留给程序猜。"
             "如果需要查看列表、展开细节、生成简报、导出、发送通知或管理任务，就主动选择工具。"
             "涉及外发、订阅修改、任务创建/删除等副作用动作时，也照常选择工具，系统会负责确认门。"
             "如果用户是在追问上一轮结果，可以使用 reference_index。"
@@ -85,6 +75,7 @@ class OpenAIIntentPlanner(IntentPlanner):
                             "window": {"type": "string", "description": "时间窗口，如 daily、7d、30d、14d。"},
                             "limit": {"type": "integer", "description": "返回条数。"},
                         },
+                        "required": ["window"],
                     },
                 },
             },
@@ -142,6 +133,7 @@ class OpenAIIntentPlanner(IntentPlanner):
                             "scope": {"type": "string", "description": "简报范围，如 daily。"},
                             "view": {"type": "string", "description": "视图，如 flash、deep、conversation。"},
                         },
+                        "required": ["view"],
                     },
                 },
             },
@@ -161,6 +153,7 @@ class OpenAIIntentPlanner(IntentPlanner):
                                 "description": "导出格式，如 md、pdf。",
                             },
                         },
+                        "required": ["repository", "formats"],
                     },
                 },
             },
@@ -180,6 +173,7 @@ class OpenAIIntentPlanner(IntentPlanner):
                                 "description": "导出格式，如 md、pdf。",
                             },
                         },
+                        "required": ["window", "formats"],
                     },
                 },
             },
@@ -199,6 +193,7 @@ class OpenAIIntentPlanner(IntentPlanner):
                                 "description": "导出格式，如 md、pdf。",
                             },
                         },
+                        "required": ["formats"],
                     },
                 },
             },
@@ -218,6 +213,7 @@ class OpenAIIntentPlanner(IntentPlanner):
                                 "description": "导出格式，如 md、pdf。",
                             },
                         },
+                        "required": ["formats"],
                     },
                 },
             },
@@ -236,6 +232,7 @@ class OpenAIIntentPlanner(IntentPlanner):
                                 "description": "导出格式，如 md、pdf。",
                             },
                         },
+                        "required": ["formats"],
                     },
                 },
             },
@@ -277,7 +274,7 @@ class OpenAIIntentPlanner(IntentPlanner):
                             "view": {"type": "string"},
                             "schedule": {"type": "string"},
                         },
-                        "required": ["channel"],
+                        "required": ["channel", "view"],
                     },
                 },
             },
@@ -450,9 +447,6 @@ class AssistantAgent:
         except ReferenceResolutionError as exc:
             log_error(self.logger, "引用解析失败", session_id=state.session_id, error=exc)
             return AssistantResponse(message=str(exc))
-        except UnsupportedTimeWindowError as exc:
-            log_error(self.logger, "时间窗口不支持", session_id=state.session_id, error=exc)
-            return AssistantResponse(message=str(exc))
         except Exception as exc:
             log_error(self.logger, "planner 调度失败", session_id=state.session_id, error=exc)
             return AssistantResponse(message=f"planner 调度失败：{exc}")
@@ -513,12 +507,9 @@ class AssistantAgent:
                     tool_input=json.loads(tool_call.function.arguments or "{}"),
                 )
                 try:
-                    normalized = self._normalize_planned_decision(decision, text, state)
+                    normalized = self._normalize_planned_decision(decision, state)
                 except ReferenceResolutionError as exc:
                     log_error(self.logger, "引用解析失败", session_id=state.session_id, error=exc)
-                    return AssistantResponse(message=str(exc))
-                except UnsupportedTimeWindowError as exc:
-                    log_error(self.logger, "时间窗口不支持", session_id=state.session_id, error=exc)
                     return AssistantResponse(message=str(exc))
 
                 response = self._execute_decision(text, state, normalized, actor_id=actor_id, save_state=False)
@@ -647,66 +638,33 @@ class AssistantAgent:
         decision = self.intent_planner.decide(message=text, state=state)
         if decision is None:
             raise RuntimeError("planner 没有返回任何工具决策。")
-        return self._normalize_planned_decision(decision, text, state)
+        return self._normalize_planned_decision(decision, state)
 
-    def _normalize_planned_decision(self, decision: IntentDecision, text: str, state: SessionState) -> IntentDecision:
+    def _normalize_planned_decision(self, decision: IntentDecision, state: SessionState) -> IntentDecision:
         tool = self.tool_registry.get(decision.tool_name)
-        tool_input = dict(decision.tool_input)
+        tool_input = {key: value for key, value in dict(decision.tool_input).items() if value is not None and value != ""}
         if decision.tool_name == "get_event_detail":
-            if "event_id" not in tool_input:
-                reference_index = tool_input.pop("reference_index", None)
-                if reference_index is not None:
-                    event_id = state.reference_map.get(str(reference_index))
-                    if event_id:
-                        tool_input["event_id"] = event_id
-            if "event_id" not in tool_input:
-                ref = self._resolve_reference(text, state)
-                if ref and ref.kind == "event":
-                    tool_input["event_id"] = ref.value
-                else:
-                    raise ReferenceResolutionError(
-                        "我知道你是在追问上一轮结果，但这次没有成功定位到具体对象。你可以说“第 3 个详细讲讲”或先重新列一次结果。"
-                    )
+            tool_input["event_id"] = self._resolve_event_id(tool_input, state)
         elif decision.tool_name == "delete_delivery_task":
-            if "task_id" not in tool_input:
-                reference_index = tool_input.pop("reference_index", None)
-                if reference_index is not None:
-                    task_id = state.reference_map.get(str(reference_index))
-                    if task_id:
-                        tool_input["task_id"] = task_id
-            if "task_id" not in tool_input:
-                tool_input["task_id"] = self._resolve_task_reference(text, state)
+            tool_input["task_id"] = self._resolve_task_id(tool_input, state)
         elif decision.tool_name == "render_briefing_preview":
-            normalized = self._build_briefing_input(state, text)
-            if "scope" in tool_input:
-                normalized["scope"] = tool_input["scope"]
-            if "view" in tool_input:
-                normalized["view"] = tool_input["view"]
-            tool_input = normalized
+            tool_input = self._build_briefing_input(state, tool_input)
         elif decision.tool_name == "add_subscription":
             tool_input.setdefault("lookback_hours", 24)
             tool_input.setdefault("refresh_minutes", 60)
         elif decision.tool_name == "create_delivery_task":
-            normalized = self._build_task_input(text)
-            normalized.update({key: value for key, value in tool_input.items() if value not in {None, ""}})
-            tool_input = normalized
+            tool_input.setdefault("target", "default")
+            tool_input.setdefault("scope", "daily")
+            tool_input.setdefault("view", "flash")
+            tool_input.setdefault("schedule", "daily")
         elif decision.tool_name == "deliver_briefing":
-            normalized = self._build_delivery_input(text, state)
-            normalized.update({key: value for key, value in tool_input.items() if value not in {None, ""}})
-            tool_input = normalized
+            tool_input.setdefault("scope", "daily")
         elif decision.tool_name == "get_trending_events":
-            tool_input.setdefault("window", self._extract_window(text))
-            tool_input.setdefault("limit", self._extract_limit(text) or 5)
+            tool_input.setdefault("limit", 5)
         elif decision.tool_name == "get_report_events":
-            if "source_name" in tool_input:
-                canonical_source = self._normalize_report_source_name(str(tool_input["source_name"]))
-                if canonical_source is None:
-                    tool_input.pop("source_name", None)
-                else:
-                    tool_input["source_name"] = canonical_source
-            tool_input.setdefault("limit", self._extract_limit(text) or 5)
+            tool_input.setdefault("limit", 5)
         elif decision.tool_name == "get_repo_update_events":
-            tool_input.setdefault("hours", self._extract_hours(text) or 168)
+            tool_input.setdefault("hours", 168)
         elif decision.tool_name in {
             "export_repository_summary",
             "export_trending",
@@ -714,7 +672,7 @@ class AssistantAgent:
             "export_report_summary",
             "export_digest",
         }:
-            tool_input = self._normalize_export_tool_input(decision.tool_name, text, state, tool_input)
+            tool_input = self._normalize_export_tool_input(decision.tool_name, state, tool_input)
 
         return IntentDecision(
             intent=decision.intent or _infer_intent_from_tool(decision.tool_name),
@@ -722,23 +680,6 @@ class AssistantAgent:
             tool_input=tool_input,
             requires_confirmation=tool.requires_confirmation,
         )
-
-    def _normalize_report_source_name(self, raw_source_name: str) -> str | None:
-        normalized = raw_source_name.strip().lower()
-        if not normalized:
-            return None
-        candidates = {source.name for source in DEFAULT_REPORT_SOURCES}
-        content_source_keys = {
-            str(row.get("source_key"))
-            for row in self.storage.load_collection("content_items")
-            if row.get("source_kind") == "ai_report" and row.get("source_key")
-        }
-        candidates.update(content_source_keys)
-        for candidate in candidates:
-            candidate_lower = candidate.lower()
-            if normalized == candidate_lower or normalized in candidate_lower or candidate_lower in normalized:
-                return candidate
-        return None
 
     def _build_response(
         self,
@@ -753,6 +694,13 @@ class AssistantAgent:
                 pending_confirmation=True,
                 confirmation_prompt=prompt,
                 raw_outputs=output,
+            )
+        if output.get("status") == "validation_error":
+            error = output.get("error") or {}
+            return AssistantResponse(
+                message=str(error.get("message") or "工具参数不合法。"),
+                raw_outputs=output,
+                error=str(error.get("error_type") or "validation_error"),
             )
 
         if decision.tool_name in {"get_trending_events", "get_repo_update_events", "get_report_events"}:
@@ -932,7 +880,7 @@ class AssistantAgent:
             return "这是一个订阅修改动作。回复“确认”继续，回复“取消”放弃。"
         return "这是一个需要确认的动作。回复“确认”继续，回复“取消”放弃。"
 
-    def _build_briefing_input(self, state: SessionState, text: str) -> dict[str, Any]:
+    def _build_briefing_input(self, state: SessionState, tool_input: dict[str, Any]) -> dict[str, Any]:
         events = []
         persisted_events = {row["event_id"]: row for row in self.storage.load_collection("events")}
         for event_id in state.last_event_ids[:5]:
@@ -941,55 +889,36 @@ class AssistantAgent:
         if not events:
             recent = self.storage.load_collection("events")[-5:]
             events.extend(recent)
-        view = "flash"
-        if "深读" in text:
-            view = "deep"
-        elif "对话" in text:
-            view = "conversation"
-        return {"scope": "daily", "view": view, "events": events}
+        normalized = dict(tool_input)
+        normalized.setdefault("scope", "daily")
+        normalized["events"] = events
+        return normalized
 
-    def _build_delivery_input(self, text: str, state: SessionState) -> dict[str, Any]:
-        channel = "webhook" if "webhook" in text.lower() else "email"
-        return {"channel": channel, "scope": "daily"}
-
-    def _build_task_input(self, text: str) -> dict[str, Any]:
-        channel = "webhook" if "webhook" in text.lower() else "email"
-        schedule = "daily"
-        view = "flash"
-        if "每周" in text:
-            schedule = "weekly"
-        elif "每小时" in text:
-            schedule = "hourly"
-        if "深读" in text:
-            view = "deep"
-        elif "对话" in text:
-            view = "conversation"
-        return {"channel": channel, "target": "default", "scope": "daily", "view": view, "schedule": schedule}
-
-    def _resolve_reference(self, text: str, state: SessionState) -> ResolvedReference | None:
-        index = self._extract_reference_index(text)
-        if index is not None:
-            event_id = state.reference_map.get(index)
+    def _resolve_event_id(self, tool_input: dict[str, Any], state: SessionState) -> str:
+        if "event_id" in tool_input and isinstance(tool_input["event_id"], str):
+            return tool_input["event_id"]
+        reference_index = tool_input.pop("reference_index", None)
+        if reference_index is not None:
+            event_id = state.reference_map.get(str(reference_index))
             if event_id:
-                return ResolvedReference(kind="event", value=event_id)
-        if any(keyword in text for keyword in ["刚才那篇", "刚刚那篇", "那个项目", "那篇报告"]) and state.last_event_ids:
-            return ResolvedReference(kind="event", value=state.last_event_ids[0])
-        if "那份简报" in text and state.last_briefing_id:
-            return ResolvedReference(kind="briefing", value=state.last_briefing_id)
-        return None
+                return event_id
+        raise ReferenceResolutionError(
+            "没有成功定位到具体对象。请让 agent 显式提供 event_id，或使用 reference_index 指向上一轮结果。"
+        )
 
-    def _resolve_task_reference(self, text: str, state: SessionState) -> str:
-        index = self._extract_reference_index(text, suffix="任务")
-        if index is not None:
-            task_id = state.reference_map.get(index)
+    def _resolve_task_id(self, tool_input: dict[str, Any], state: SessionState) -> str:
+        if "task_id" in tool_input and isinstance(tool_input["task_id"], str):
+            return tool_input["task_id"]
+        reference_index = tool_input.pop("reference_index", None)
+        if reference_index is not None:
+            task_id = state.reference_map.get(str(reference_index))
             if task_id:
                 return task_id
-        raise ValueError("没有识别到要删除的任务，请先查看任务列表后再说“删除第 N 个任务”。")
+        raise ReferenceResolutionError("没有定位到要删除的任务，请先列出任务后再通过 reference_index 指定。")
 
     def _normalize_export_tool_input(
         self,
         tool_name: str,
-        text: str,
         state: SessionState,
         raw_input: dict[str, Any],
     ) -> dict[str, Any]:
@@ -998,13 +927,10 @@ class AssistantAgent:
             for key, value in raw_input.items()
             if value is not None and value != "" and value != []
         }
-        tool_input["formats"] = self._normalize_export_formats(text, tool_input.get("formats"))
         if tool_name == "export_repository_summary":
-            tool_input.setdefault("repository", self._resolve_repository_for_export(text, state))
-            tool_input.setdefault("hours", self._extract_hours(text) or int(state.last_query.get("hours") or 168))
+            tool_input.setdefault("hours", 168)
         elif tool_name == "export_trending":
-            tool_input.setdefault("window", self._extract_window(text) if self._mentions_trending(text) else state.last_query.get("window", "daily"))
-            tool_input.setdefault("limit", self._extract_limit(text) or int(state.last_query.get("limit") or 5))
+            tool_input.setdefault("limit", 5)
         elif tool_name == "export_report":
             existing_report_id = tool_input.get("report_id")
             if isinstance(existing_report_id, str) and not existing_report_id.startswith("report:"):
@@ -1023,54 +949,11 @@ class AssistantAgent:
                         report_id = self._extract_report_id_from_event(event)
                         if report_id:
                             tool_input["report_id"] = report_id
-            tool_input.setdefault("report_id", self._resolve_report_id_for_export(text, state))
         elif tool_name == "export_report_summary":
-            source_name = tool_input.get("source_name") or self._extract_source_name_for_export(text, state)
-            if source_name:
-                tool_input["source_name"] = source_name
-            tool_input.setdefault("limit", self._extract_limit(text) or int(state.last_query.get("limit") or 10))
+            tool_input.setdefault("limit", 10)
         elif tool_name == "export_digest":
-            tool_input.setdefault("scope", str(state.last_query.get("scope") or "daily"))
+            tool_input.setdefault("scope", "daily")
         return tool_input
-
-    def _resolve_repository_for_export(self, text: str, state: SessionState) -> str:
-        repository = self._extract_repository(text, required=False)
-        if repository:
-            return repository
-        last_repo = state.last_query.get("repository")
-        if isinstance(last_repo, str) and last_repo:
-            return last_repo
-        if state.last_subject and "/" in state.last_subject:
-            return state.last_subject
-        raise ValueError("没有识别到要导出的仓库，请先查询某个仓库更新，或直接提供 owner/name。")
-
-    def _resolve_report_id_for_export(self, text: str, state: SessionState) -> str:
-        reference = self._resolve_reference(text, state)
-        if reference and reference.kind == "event":
-            event = self._find_event_by_id(reference.value)
-            report_id = self._extract_report_id_from_event(event)
-            if report_id:
-                return report_id
-        last_report_id = state.last_query.get("report_id")
-        if isinstance(last_report_id, str) and last_report_id:
-            return last_report_id
-        if state.last_event_ids:
-            event = self._find_event_by_id(state.last_event_ids[0])
-            report_id = self._extract_report_id_from_event(event)
-            if report_id:
-                return report_id
-        raise ValueError("没有定位到可导出的报告，请先打开某条报告详情，或说“导出第 1 个报告”。")
-
-    def _extract_source_name_for_export(self, text: str, state: SessionState) -> str | None:
-        source_name = self._normalize_report_source_name(text)
-        if source_name:
-            return source_name
-        last_source = state.last_query.get("source_name")
-        if isinstance(last_source, str) and last_source:
-            return last_source
-        if state.last_subject and self._normalize_report_source_name(state.last_subject):
-            return self._normalize_report_source_name(state.last_subject)
-        return None
 
     def _find_event_by_id(self, event_id: str) -> dict[str, Any] | None:
         return next(
@@ -1090,25 +973,6 @@ class AssistantAgent:
             if isinstance(content_ref, str) and content_ref:
                 return f"report:{content_ref}"
         return None
-
-    @staticmethod
-    def _normalize_export_formats(text: str, formats: Any = None) -> list[str]:
-        if isinstance(formats, list) and formats:
-            normalized = [str(item).lower() for item in formats if str(item).strip()]
-            return normalized or ["md"]
-        lowered = text.lower()
-        wants_pdf = "pdf" in lowered
-        wants_md = any(token in lowered for token in ["md", "markdown"])
-        if wants_pdf and wants_md:
-            return ["md", "pdf"]
-        if wants_pdf:
-            return ["pdf"]
-        return ["md"]
-
-    @staticmethod
-    def _mentions_trending(text: str) -> bool:
-        lowered = text.lower()
-        return any(keyword in lowered for keyword in ["热门", "最火", "trending", "排行榜", "上榜", "star增长"])
 
     @staticmethod
     def _extract_reference_index(text: str, suffix: str = "个") -> str | None:
@@ -1144,54 +1008,6 @@ class AssistantAgent:
         if "十" in token and len(token) == 3:
             return str(chinese_map.get(token[0], 0) * 10 + chinese_map.get(token[2], 0))
         return str(chinese_map.get(token, 0)) if token in chinese_map else None
-
-    @staticmethod
-    def _extract_window(text: str) -> str:
-        lowered = text.lower()
-        if AssistantAgent._mentions_unsupported_trending_window(text):
-            raise UnsupportedTimeWindowError(
-                "当前热门榜能力只稳定支持 daily、7d 和 30d。你刚才说的是“两个月/60天”这类更长时间窗，我现在不能准确按这个口径给你排行。你可以改问“最近30天最火的项目”或“最近7天 star 增长最快的项目”。"
-            )
-        if any(keyword in lowered for keyword in ["weekly", "7d", "这周", "最近七天"]):
-            return "7d"
-        if any(keyword in lowered for keyword in ["monthly", "30d", "这个月", "最近三十天", "最近30天", "最近一个月", "一个月"]):
-            return "30d"
-        return "daily"
-
-    @staticmethod
-    def _mentions_unsupported_trending_window(text: str) -> bool:
-        normalized = text.lower().replace(" ", "")
-        if any(keyword in normalized for keyword in ["两个月", "2个月", "两月", "2月", "最近两个月", "最近两月"]):
-            return True
-        if any(keyword in normalized for keyword in ["60天", "最近60天", "六十天", "最近六十天"]):
-            return True
-        return False
-
-    @staticmethod
-    def _extract_hours(text: str) -> int | None:
-        match = re.search(r"(\d+)\s*小时", text)
-        if match:
-            return int(match.group(1))
-        match = re.search(r"(\d+)\s*天", text)
-        if match:
-            return int(match.group(1)) * 24
-        return None
-
-    @staticmethod
-    def _extract_limit(text: str) -> int | None:
-        match = re.search(r"(\d+)\s*(个|条|篇)", text)
-        if match:
-            return int(match.group(1))
-        return None
-
-    @staticmethod
-    def _extract_repository(text: str, *, required: bool = True) -> str | None:
-        match = re.search(r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\b", text)
-        if match:
-            return match.group(1).lower()
-        if required:
-            raise ValueError("没有识别到仓库名，请使用 owner/name 格式。")
-        return None
 
     @staticmethod
     def _is_confirmation_message(text: str) -> bool:

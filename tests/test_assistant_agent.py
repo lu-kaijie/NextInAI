@@ -177,10 +177,10 @@ def test_assistant_agent_returns_explicit_message_when_reference_resolution_fail
 
     response = agent.respond("第三个详细讲讲", session_id="session-missing-ref")
 
-    assert "我知道你是在追问上一轮结果" in response.message
+    assert "没有成功定位到具体对象" in response.message
 
 
-def test_assistant_agent_returns_explicit_message_for_unsupported_trending_window(tmp_path) -> None:
+def test_assistant_agent_returns_validation_error_for_unsupported_trending_window(tmp_path) -> None:
     storage = FileStorage(tmp_path)
     agent = AssistantAgent(
         storage=storage,
@@ -189,8 +189,21 @@ def test_assistant_agent_returns_explicit_message_for_unsupported_trending_windo
 
     response = agent.respond("最近两个月star增长最快的五个项目", session_id="session-unsupported-window")
 
-    assert "当前热门榜能力只稳定支持 daily、7d 和 30d" in response.message
-    assert "最近30天最火的项目" in response.message
+    assert "参数 window 不支持值 '60d'" in response.message
+    assert response.raw_outputs["error"]["allowed_values"] == ["daily", "7d", "30d"]
+
+
+def test_assistant_agent_returns_validation_error_for_missing_required_export_format(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    agent = AssistantAgent(
+        storage=storage,
+        intent_planner=FakePlanner("export_trending", {"window": "daily"}),
+    )
+
+    response = agent.respond("导出热门榜", session_id="session-missing-export-format")
+
+    assert "缺少必填参数：formats" in response.message
+    assert response.raw_outputs["error"]["error_type"] == "missing_required_field"
 
 
 def test_assistant_agent_requires_confirmation_for_side_effects(tmp_path) -> None:
@@ -388,7 +401,7 @@ def test_assistant_agent_can_use_planner_for_reports_by_source(tmp_path) -> None
     )
     agent = AssistantAgent(
         storage=storage,
-        intent_planner=FakePlanner("get_report_events", {"source_name": "OpenAI", "limit": 5}),
+        intent_planner=FakePlanner("get_report_events", {"source_name": "OpenAI News", "limit": 5}),
     )
 
     response = agent.respond("看看 OpenAI 最近的报告", session_id="session-source-report")
@@ -475,7 +488,7 @@ def test_assistant_agent_can_export_report_summary_from_chat(tmp_path, monkeypat
         intent_planner=SequencedPlanner(
             [
                 ("get_report_events", {"limit": 1}, "query_intelligence"),
-                ("export_report_summary", {"formats": ["pdf"]}, "export_intelligence"),
+                ("export_report_summary", {"source_name": "OpenAI News", "formats": ["pdf"]}, "export_intelligence"),
             ]
         ),
     )
@@ -533,7 +546,7 @@ def test_assistant_agent_can_export_report_detail_from_chat(tmp_path, monkeypatc
             [
                 ("get_report_events", {"limit": 1}, "query_intelligence"),
                 ("get_event_detail", {"reference_index": 1}, "explore_detail"),
-                ("export_report", {"formats": ["md"]}, "export_intelligence"),
+                ("export_report", {"reference_index": 1, "formats": ["md"]}, "export_intelligence"),
             ]
         ),
     )

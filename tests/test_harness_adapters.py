@@ -1,14 +1,14 @@
 from datetime import datetime, timezone
 
 from nextinai.agents import ReportInterpretation, TrendingProjectAnalysis
-from nextinai.collectors.trending import TrendingRepository
+from nextinai.collectors.trending import TrendingQueryPlan, TrendingQueryResult, TrendingRepository
 from nextinai.harness.adapters import BriefingViewBuilder, IntelligenceEventAdapter
 from nextinai.storage.files import FileStorage
 
 
 class FakeTrendingCollector:
-    def collect(self, window: str, limit: int):
-        return [
+    def collect_with_metadata(self, window: str, limit: int):
+        repositories = [
             TrendingRepository(
                 full_name="mattpocock/skills",
                 html_url="https://github.com/mattpocock/skills",
@@ -24,6 +24,16 @@ class FakeTrendingCollector:
                 stars_in_period="7,280",
             )
         ][:limit]
+        return TrendingQueryResult(
+            plan=TrendingQueryPlan(
+                requested_window=window,
+                source_mode="official_trending",
+                source_label="GitHub 官方 Trending",
+                resolved_window=window,
+                is_official=True,
+            ),
+            repositories=repositories,
+        )
 
 
 class FakeIntelligenceAgent:

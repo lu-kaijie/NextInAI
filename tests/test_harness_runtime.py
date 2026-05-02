@@ -17,12 +17,23 @@ class EchoTool:
 class DangerousTool:
     name = "dangerous"
     description = "dangerous"
-    input_schema = {}
+    input_schema = {"target": "str"}
     output_schema = {}
     requires_confirmation = True
 
     def execute(self, context, tool_input):
         return {"message": "executed"}
+
+
+class EnumTool:
+    name = "enum-tool"
+    description = "enum"
+    input_schema = {"window": "daily|7d|30d"}
+    output_schema = {}
+    requires_confirmation = False
+
+    def execute(self, context, tool_input):
+        return {"window": tool_input["window"]}
 
 
 def test_file_session_state_store_roundtrip(tmp_path) -> None:
@@ -65,3 +76,44 @@ def test_execution_engine_requires_confirmation_for_action_tool(tmp_path) -> Non
     assert result.output["status"] == "pending_confirmation"
     rows = storage.load_collection("job_runs")
     assert rows[0]["tool_calls"][0]["requires_confirmation"] is True
+
+
+def test_execution_engine_returns_structured_validation_error_for_missing_required_field(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    registry = ToolRegistry()
+    registry.register(DangerousTool())
+    engine = ExecutionEngine(tool_registry=registry, storage=storage)
+    context = RunContext.create(trigger_type="chat")
+
+    result = engine.execute_tool(context, "dangerous", {})
+
+    assert result.output["status"] == "validation_error"
+    assert result.output["error"]["error_type"] == "missing_required_field"
+    assert result.output["error"]["field"] == "target"
+
+
+def test_execution_engine_validates_before_confirmation_gate(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    registry = ToolRegistry()
+    registry.register(DangerousTool())
+    engine = ExecutionEngine(tool_registry=registry, storage=storage)
+    context = RunContext.create(trigger_type="chat")
+
+    result = engine.execute_tool(context, "dangerous", {"target": None})
+
+    assert result.output["status"] == "validation_error"
+    assert result.output["error"]["error_type"] == "missing_required_field"
+
+
+def test_execution_engine_returns_allowed_values_for_unsupported_enum(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    registry = ToolRegistry()
+    registry.register(EnumTool())
+    engine = ExecutionEngine(tool_registry=registry, storage=storage)
+    context = RunContext.create(trigger_type="chat", allowed_tools=["enum-tool"])
+
+    result = engine.execute_tool(context, "enum-tool", {"window": "60d"})
+
+    assert result.output["status"] == "validation_error"
+    assert result.output["error"]["error_type"] == "unsupported_parameter"
+    assert result.output["error"]["allowed_values"] == ["daily", "7d", "30d"]
