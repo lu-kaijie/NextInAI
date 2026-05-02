@@ -82,8 +82,13 @@ class IntelligenceEventAdapter:
         return events[:limit]
 
     def get_trending_events(self, window: str, limit: int = 10) -> list[IntelligenceEvent]:
-        repositories = self.collector.collect(window, limit)
-        return [self._build_trending_event(window, repo) for repo in repositories]
+        query_result = self.collector.collect_with_metadata(window, limit)
+        if query_result.plan.resolved_window is None:
+            return []
+        return [
+            self._build_trending_event(window, repo, query_result.plan.source_mode, query_result.plan.source_label)
+            for repo in query_result.repositories
+        ]
 
     def persist_events(self, events: list[IntelligenceEvent]) -> int:
         existing = self.storage.load_collection("events")
@@ -212,7 +217,13 @@ class IntelligenceEventAdapter:
             metadata={"partial": bool(content_row.get("partial")), "has_analysis": analysis_row is not None},
         )
 
-    def _build_trending_event(self, window: str, repo: TrendingRepository) -> IntelligenceEvent:
+    def _build_trending_event(
+        self,
+        window: str,
+        repo: TrendingRepository,
+        source_mode: str,
+        source_label: str,
+    ) -> IntelligenceEvent:
         analysis = self.agent.analyze_trending_repository(repo)
         heat_value = self._parse_heat(repo.stars_in_period)
         confidence_score = 0.9 if not repo.partial else 0.68
@@ -254,6 +265,8 @@ class IntelligenceEventAdapter:
                 "language": repo.language,
                 "stars_in_period": repo.stars_in_period,
                 "confidence_label": analysis.confidence,
+                "source_mode": source_mode,
+                "source_label": source_label,
             },
         )
 

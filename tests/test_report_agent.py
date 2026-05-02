@@ -170,3 +170,135 @@ def test_report_service_emits_progress_messages(tmp_path) -> None:
     assert any("开始抓取来源：OpenAI News" in message for message in progress_messages)
     assert any("collector:OpenAI News" in message for message in progress_messages)
     assert any("正在解读：Agent roadmap update" in message for message in progress_messages)
+
+
+def test_report_service_lists_sources_reports_and_detail(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    service = AgenticReportService(
+        storage=storage,
+        collector=FakeReportCollector([]),
+        agent=FakeInterpreter(),
+        sources=[
+            ReportSource("OpenAI News", "default", "feed", "https://example.com/feed.xml"),
+            ReportSource("Hugging Face Blog", "default", "feed", "https://example.com/hf.xml"),
+        ],
+    )
+    report = CollectedReportItem(
+        source_name="OpenAI News",
+        title="Agent roadmap update",
+        url="https://example.com/agent-roadmap",
+        published_at="2026-04-30T00:00:00+00:00",
+        summary_text="roadmap",
+        body_text="details",
+        metadata_json={"group": "default"},
+        partial=False,
+    )
+    fingerprint = service._build_fingerprint(report)
+    storage.save_collection("content_items", [service._build_content_record(report, fingerprint)])
+    storage.save_collection(
+        "analysis_results",
+        [
+            {
+                "analysis_kind": "report_interpretation",
+                "source_ref": f"report:{fingerprint}",
+                "title": report.title,
+                "factual_summary": "事实：Agent roadmap update",
+                "interpreted_summary": "解读：OpenAI News",
+                "evidence_json": [],
+                "is_partial": False,
+            }
+        ],
+    )
+
+    sources = service.list_sources("default")
+    reports = service.list_reports("OpenAI News", limit=5)
+    detail = service.get_report_detail(f"report:{fingerprint}")
+
+    assert len(sources) == 2
+    assert reports[0]["title"] == "Agent roadmap update"
+    assert detail is not None
+    assert detail["interpreted_summary"] == "解读：OpenAI News"
+
+
+def test_report_service_can_export_report_detail(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    service = AgenticReportService(
+        storage=storage,
+        collector=FakeReportCollector([]),
+        agent=FakeInterpreter(),
+        sources=[ReportSource("OpenAI News", "default", "feed", "https://example.com/feed.xml")],
+    )
+    service.report_output_dir = tmp_path / "artifacts"
+    report = CollectedReportItem(
+        source_name="OpenAI News",
+        title="Agent roadmap update",
+        url="https://example.com/agent-roadmap",
+        published_at="2026-04-30T00:00:00+00:00",
+        summary_text="roadmap",
+        body_text="details",
+        metadata_json={"group": "default"},
+        partial=False,
+    )
+    fingerprint = service._build_fingerprint(report)
+    storage.save_collection("content_items", [service._build_content_record(report, fingerprint)])
+    storage.save_collection(
+        "analysis_results",
+        [
+            {
+                "analysis_kind": "report_interpretation",
+                "source_ref": f"report:{fingerprint}",
+                "title": report.title,
+                "factual_summary": "事实：Agent roadmap update",
+                "interpreted_summary": "解读：OpenAI News",
+                "evidence_json": [],
+                "is_partial": False,
+            }
+        ],
+    )
+
+    exported = service.export_report(f"report:{fingerprint}", ["md", "pdf"])
+
+    assert exported["md"].endswith(".md")
+    assert exported["pdf"].endswith(".pdf")
+
+
+def test_report_service_can_export_report_summary(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    service = AgenticReportService(
+        storage=storage,
+        collector=FakeReportCollector([]),
+        agent=FakeInterpreter(),
+        sources=[ReportSource("OpenAI News", "default", "feed", "https://example.com/feed.xml")],
+    )
+    service.report_output_dir = tmp_path / "artifacts"
+    report = CollectedReportItem(
+        source_name="OpenAI News",
+        title="Agent roadmap update",
+        url="https://example.com/agent-roadmap",
+        published_at="2026-04-30T00:00:00+00:00",
+        summary_text="roadmap",
+        body_text="details",
+        metadata_json={"group": "default"},
+        partial=False,
+    )
+    fingerprint = service._build_fingerprint(report)
+    storage.save_collection("content_items", [service._build_content_record(report, fingerprint)])
+    storage.save_collection(
+        "analysis_results",
+        [
+            {
+                "analysis_kind": "report_interpretation",
+                "source_ref": f"report:{fingerprint}",
+                "title": report.title,
+                "factual_summary": "事实：Agent roadmap update",
+                "interpreted_summary": "解读：OpenAI News",
+                "evidence_json": [],
+                "is_partial": False,
+            }
+        ],
+    )
+
+    exported = service.export_report_summary("OpenAI News", 10, ["md", "pdf"])
+
+    assert exported["md"].endswith(".md")
+    assert exported["pdf"].endswith(".pdf")

@@ -11,6 +11,22 @@ import httpx
 
 
 @dataclass(slots=True)
+class TrendingQueryPlan:
+    requested_window: str
+    resolved_window: str | None
+    source_mode: str
+    source_label: str
+    is_official: bool
+    unsupported_reason: str | None = None
+
+
+@dataclass(slots=True)
+class TrendingQueryResult:
+    plan: TrendingQueryPlan
+    repositories: list["TrendingRepository"]
+
+
+@dataclass(slots=True)
 class TrendingRepository:
     full_name: str
     html_url: str
@@ -48,10 +64,17 @@ class GitHubTrendingCollector:
             self.client.close()
 
     def collect(self, window: str, limit: int) -> list[TrendingRepository]:
-        since = self._parse_window(window)
+        return self.collect_with_metadata(window, limit).repositories
+
+    def collect_with_metadata(self, window: str, limit: int) -> TrendingQueryResult:
+        plan = self.build_query_plan(window)
+        if plan.resolved_window is None:
+            return TrendingQueryResult(plan=plan, repositories=[])
+        since = plan.resolved_window
         response = self.client.get("/trending", params={"since": since})
         response.raise_for_status()
-        return self._parse_trending_page(response.text)[:limit]
+        repositories = self._parse_trending_page(response.text)[:limit]
+        return TrendingQueryResult(plan=plan, repositories=repositories)
 
     def _fetch_readme_excerpt(self, full_name: str) -> str | None:
         response = self.client.get(f"/{full_name}/raw/HEAD/README.md")
@@ -67,15 +90,49 @@ class GitHubTrendingCollector:
         return None
 
     @staticmethod
-    def _parse_window(window: str) -> str:
+    @staticmethod
+    def build_query_plan(window: str) -> TrendingQueryPlan:
         normalized = window.strip().lower()
         if normalized in {"daily", "1d", "today"}:
-            return "daily"
+            return TrendingQueryPlan(
+                requested_window=window,
+                resolved_window="daily",
+                source_mode="official_trending_page",
+                source_label="GitHub 官方 Trending 页面（日榜）",
+                is_official=True,
+            )
         if normalized in {"weekly", "7d"}:
-            return "weekly"
+            return TrendingQueryPlan(
+                requested_window=window,
+                resolved_window="weekly",
+                source_mode="official_trending_page",
+                source_label="GitHub 官方 Trending 页面（周榜）",
+                is_official=True,
+            )
         if normalized in {"monthly", "30d"}:
-            return "monthly"
-        raise ValueError("热门榜时间窗口仅支持 daily、1d、7d、30d、weekly 或 monthly。")
+            return TrendingQueryPlan(
+                requested_window=window,
+                resolved_window="monthly",
+                source_mode="official_trending_page",
+                source_label="GitHub 官方 Trending 页面（月榜）",
+                is_official=True,
+            )
+        if re.fullmatch(r"\d+d", normalized):
+            return TrendingQueryPlan(
+                requested_window=window,
+                resolved_window=None,
+                source_mode="unsupported",
+                source_label="当前未提供替代口径",
+                is_official=False,
+                unsupported_reason=(
+                    "GitHub 官方 Trending 页面当前只稳定提供 daily、weekly、monthly 三种时间窗口，"
+                    f"不直接支持 {window} 这样的自定义天数查询。"
+                ),
+            )
+        raise ValueError(
+            "热门榜时间窗口仅支持 daily、1d、7d、30d、weekly 或 monthly；"
+            "如果要更细粒度窗口，需要明确采用非官方替代口径。"
+        )
 
     def _parse_trending_page(self, html_text: str) -> list[TrendingRepository]:
         articles = re.findall(r"<article[^>]*class=\"Box-row\"[^>]*>(.*?)</article>", html_text, re.S)

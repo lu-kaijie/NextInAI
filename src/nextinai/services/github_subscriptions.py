@@ -15,6 +15,7 @@ from nextinai.core.config import get_settings
 from nextinai.core.logging import get_logger, log_error, log_event
 from nextinai.domain.enums import SourceKind
 from nextinai.services.contracts import SubscriptionRecord, SubscriptionService
+from nextinai.services.export_service import IntelligenceExportService
 from nextinai.storage.files import FileStorage, ensure_workspace
 from nextinai.storage.state import CheckpointState
 
@@ -59,6 +60,7 @@ class GitHubSubscriptionService(SubscriptionService):
             )
         else:
             self.agent = RuleBasedIntelligenceAgent()
+        self.export_service = IntelligenceExportService()
 
     def add_subscription(self, repository: str, lookback_hours: int, refresh_minutes: int) -> str:
         normalized = validate_repository(repository)
@@ -165,6 +167,16 @@ class GitHubSubscriptionService(SubscriptionService):
         )
         log_event(self.logger, "仓库摘要完成", repository=normalized, item_count=len(repo_items))
         return result
+
+    def export_repository_summary(self, repository: str, hours: int, formats: list[str]) -> dict[str, str]:
+        normalized = validate_repository(repository)
+        markdown = self.summarize_repository(normalized, hours)
+        return self.export_service.export_markdown_content(
+            title=f"{normalized}-{hours}h-summary",
+            markdown=markdown,
+            slug_prefix="repo-summary",
+            formats=formats,
+        )
 
     def _resolve_subscriptions(self, repository: str | None) -> list[dict[str, Any]]:
         subscriptions = self.storage.load_collection("subscriptions")

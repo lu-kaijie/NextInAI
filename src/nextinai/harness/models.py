@@ -198,6 +198,7 @@ class RunContext:
 class SessionState:
     session_id: str
     last_intent: str | None = None
+    last_query: dict[str, Any] = field(default_factory=dict)
     last_event_ids: list[str] = field(default_factory=list)
     last_briefing_id: str | None = None
     last_subject: str | None = None
@@ -215,6 +216,7 @@ class SessionState:
         return cls(
             session_id=payload["session_id"],
             last_intent=payload.get("last_intent"),
+            last_query=dict(payload.get("last_query") or {}),
             last_event_ids=list(payload.get("last_event_ids") or []),
             last_briefing_id=payload.get("last_briefing_id"),
             last_subject=payload.get("last_subject"),

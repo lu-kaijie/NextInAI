@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from uuid import uuid4
 
 from nextinai.core.config import get_settings
 from nextinai.harness.adapters import BriefingViewBuilder, IntelligenceEventAdapter
-from nextinai.harness.models import DeliveryTask, RunContext
+from nextinai.harness.models import RunContext
 from nextinai.harness.runtime import Tool, ToolRegistry
 from nextinai.services.registry import ServiceRegistry, build_service_registry
+from nextinai.services.task_store import DeliveryTaskStore
 from nextinai.storage.files import FileStorage, ensure_workspace
 
 
@@ -46,44 +46,6 @@ class ActionTool:
         return self.handler(tool_input)
 
 
-class DeliveryTaskStore:
-    """Manage delivery task records on top of file storage."""
-
-    def __init__(self, storage: FileStorage | None = None) -> None:
-        self.storage = storage or _build_storage()
-
-    def list_tasks(self) -> list[dict[str, Any]]:
-        return self.storage.load_collection("delivery_tasks")
-
-    def create_task(self, *, channel: str, target: str, scope: str, view: str, schedule: str | None) -> DeliveryTask:
-        task = DeliveryTask(
-            task_id=str(uuid4()),
-            channel=channel,
-            target=target,
-            scope=scope,
-            view=view,
-            schedule=schedule,
-        )
-        rows = self.storage.load_collection("delivery_tasks")
-        rows.append(task.to_dict())
-        self.storage.save_collection("delivery_tasks", rows)
-        return task
-
-    def delete_task(self, task_id: str) -> bool:
-        rows = self.storage.load_collection("delivery_tasks")
-        remaining = [row for row in rows if row.get("task_id") != task_id]
-        deleted = len(remaining) != len(rows)
-        if deleted:
-            self.storage.save_collection("delivery_tasks", remaining)
-        return deleted
-
-    def get_task(self, task_id: str) -> dict[str, Any] | None:
-        for row in self.storage.load_collection("delivery_tasks"):
-            if row.get("task_id") == task_id:
-                return row
-        return None
-
-
 def build_harness_tool_registry(
     *,
     service_registry: ServiceRegistry | None = None,
@@ -93,10 +55,10 @@ def build_harness_tool_registry(
     """Build the first minimal harness toolset."""
 
     services = service_registry or build_service_registry()
+    capability = services.capability_service
     storage = storage or _build_storage()
     event_adapter = event_adapter or IntelligenceEventAdapter(storage=storage)
     briefing_builder = BriefingViewBuilder()
-    delivery_task_store = DeliveryTaskStore(storage)
 
     registry = ToolRegistry()
 
@@ -106,10 +68,7 @@ def build_harness_tool_registry(
             description="查询 GitHub 热门榜并返回结构化热门事件。",
             input_schema={"window": "daily|7d|30d", "limit": "int"},
             output_schema={"events": "list"},
-            handler=lambda payload: _query_and_persist_events(
-                event_adapter,
-                event_adapter.get_trending_events(payload["window"], payload.get("limit", 10)),
-            ),
+            handler=lambda payload: {"events": capability.get_trending_events(payload["window"], payload.get("limit", 10))},
         )
     )
     registry.register(
@@ -118,10 +77,9 @@ def build_harness_tool_registry(
             description="查询已采集仓库在指定窗口内的更新事件。",
             input_schema={"repository": "owner/name", "hours": "int"},
             output_schema={"events": "list"},
-            handler=lambda payload: _query_and_persist_events(
-                event_adapter,
-                event_adapter.get_repo_update_events(payload["repository"], payload.get("hours", 24)),
-            ),
+            handler=lambda payload: {
+                "events": capability.get_repo_update_events(payload["repository"], payload.get("hours", 24))
+            },
         )
     )
     registry.register(
@@ -130,13 +88,12 @@ def build_harness_tool_registry(
             description="查询已采集 AI 公司/论坛报告的解读事件。",
             input_schema={"source_name": "optional str", "limit": "int"},
             output_schema={"events": "list"},
-            handler=lambda payload: _query_and_persist_events(
-                event_adapter,
-                event_adapter.get_report_events(
+            handler=lambda payload: {
+                "events": capability.get_report_events(
                     source_name=payload.get("source_name"),
                     limit=payload.get("limit", 10),
-                ),
-            ),
+                )
+            },
         )
     )
     registry.register(
@@ -145,12 +102,7 @@ def build_harness_tool_registry(
             description="从已持久化事件集合里读取单个事件详情。",
             input_schema={"event_id": "str"},
             output_schema={"event": "dict|null"},
-            handler=lambda payload: {
-                "event": next(
-                    (row for row in storage.load_collection("events") if row.get("event_id") == payload["event_id"]),
-                    None,
-                )
-            },
+            handler=lambda payload: {"event": capability.get_event_detail(payload["event_id"])},
         )
     )
     registry.register(
@@ -174,7 +126,7 @@ def build_harness_tool_registry(
             description="读取当前已定义的定时交付任务。",
             input_schema={},
             output_schema={"tasks": "list"},
-            handler=lambda payload: {"tasks": delivery_task_store.list_tasks()},
+            handler=lambda payload: {"tasks": capability.list_delivery_tasks()},
         )
     )
     registry.register(
@@ -199,11 +151,11 @@ def build_harness_tool_registry(
             input_schema={"scope": "str", "view": "flash|deep|conversation", "events": "list"},
             output_schema={"markdown": "str"},
             handler=lambda payload: {
-                "markdown": briefing_builder.build_briefing(
-                    scope=payload["scope"],
-                    view=payload.get("view", "flash"),
-                    events=[_event_from_dict(item) for item in payload["events"]],
-                ).content_markdown
+                "markdown": capability.render_briefing_preview(
+                    payload["scope"],
+                    payload.get("view", "flash"),
+                    payload["events"],
+                )
             },
         )
     )
@@ -214,7 +166,7 @@ def build_harness_tool_registry(
             input_schema={"channel": "email|webhook", "scope": "str", "target": "optional str"},
             output_schema={"message": "str"},
             handler=lambda payload: {
-                "message": services.notification_service.send(
+                "message": capability.send_notification(
                     channel=payload["channel"],
                     content_kind="digest",
                     scope=payload.get("scope", "daily"),
@@ -230,7 +182,7 @@ def build_harness_tool_registry(
             input_schema={"repository": "owner/name", "lookback_hours": "int", "refresh_minutes": "int"},
             output_schema={"repository": "str"},
             handler=lambda payload: {
-                "repository": services.subscription_service.add_subscription(
+                "repository": capability.add_subscription(
                     payload["repository"],
                     payload.get("lookback_hours", 24),
                     payload.get("refresh_minutes", 60),
@@ -245,13 +197,13 @@ def build_harness_tool_registry(
             input_schema={"channel": "email|webhook", "target": "str", "scope": "str", "view": "str", "schedule": "str"},
             output_schema={"task": "dict"},
             handler=lambda payload: {
-                "task": delivery_task_store.create_task(
+                "task": capability.create_delivery_task(
                     channel=payload["channel"],
                     target=payload["target"],
                     scope=payload.get("scope", "daily"),
                     view=payload.get("view", "flash"),
                     schedule=payload.get("schedule"),
-                ).to_dict()
+                )
             },
         )
     )
@@ -261,7 +213,85 @@ def build_harness_tool_registry(
             description="删除一个本地定时推送任务记录。",
             input_schema={"task_id": "str"},
             output_schema={"deleted": "bool"},
-            handler=lambda payload: {"deleted": delivery_task_store.delete_task(payload["task_id"])},
+            handler=lambda payload: {"deleted": capability.delete_delivery_task(payload["task_id"])},
+        )
+    )
+    registry.register(
+        ActionTool(
+            name="export_repository_summary",
+            description="导出单仓库更新摘要。",
+            input_schema={"repository": "owner/name", "hours": "int", "formats": "list[str]"},
+            output_schema={"exports": "dict"},
+            requires_confirmation=False,
+            handler=lambda payload: {
+                "exports": capability.export_repository_summary(
+                    payload["repository"],
+                    payload.get("hours", 168),
+                    payload.get("formats", ["md"]),
+                )
+            },
+        )
+    )
+    registry.register(
+        ActionTool(
+            name="export_trending",
+            description="导出热门榜分析结果。",
+            input_schema={"window": "str", "limit": "int", "formats": "list[str]"},
+            output_schema={"exports": "dict"},
+            requires_confirmation=False,
+            handler=lambda payload: {
+                "exports": capability.export_trending(
+                    payload.get("window", "daily"),
+                    payload.get("limit", 5),
+                    payload.get("formats", ["md"]),
+                )
+            },
+        )
+    )
+    registry.register(
+        ActionTool(
+            name="export_report",
+            description="导出单条报告详细解读。",
+            input_schema={"report_id": "str", "formats": "list[str]"},
+            output_schema={"exports": "dict"},
+            requires_confirmation=False,
+            handler=lambda payload: {
+                "exports": capability.export_report(
+                    payload["report_id"],
+                    payload.get("formats", ["md"]),
+                )
+            },
+        )
+    )
+    registry.register(
+        ActionTool(
+            name="export_report_summary",
+            description="导出报告摘要列表。",
+            input_schema={"source_name": "optional str", "limit": "int", "formats": "list[str]"},
+            output_schema={"exports": "dict"},
+            requires_confirmation=False,
+            handler=lambda payload: {
+                "exports": capability.export_report_summary(
+                    payload.get("source_name"),
+                    payload.get("limit", 10),
+                    payload.get("formats", ["md"]),
+                )
+            },
+        )
+    )
+    registry.register(
+        ActionTool(
+            name="export_digest",
+            description="导出简报或 briefing。",
+            input_schema={"scope": "str", "formats": "list[str]"},
+            output_schema={"exports": "dict"},
+            requires_confirmation=False,
+            handler=lambda payload: {
+                "exports": capability.export_digest(
+                    payload.get("scope", "daily"),
+                    payload.get("formats", ["md"]),
+                )
+            },
         )
     )
     return registry
@@ -293,8 +323,3 @@ def _event_from_dict(payload: dict[str, Any]):
         created_at=payload.get("created_at"),
         updated_at=payload.get("updated_at"),
     )
-
-
-def _query_and_persist_events(event_adapter: IntelligenceEventAdapter, events: list[Any]) -> dict[str, Any]:
-    event_adapter.persist_events(events)
-    return {"events": [event.to_dict() for event in events]}

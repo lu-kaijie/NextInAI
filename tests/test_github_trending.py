@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from nextinai.agents import ReportInterpretation, TrendingProjectAnalysis
-from nextinai.collectors.trending import GitHubTrendingCollector, TrendingRepository
+from nextinai.collectors.trending import GitHubTrendingCollector, TrendingQueryPlan, TrendingQueryResult, TrendingRepository
 from nextinai.services.github_trending import GitHubTrendingService
 
 
@@ -13,6 +13,19 @@ class FakeTrendingCollector:
     def collect(self, window: str, limit: int):
         self.calls.append((window, limit))
         return self.repositories[:limit]
+
+    def collect_with_metadata(self, window: str, limit: int):
+        self.calls.append((window, limit))
+        return TrendingQueryResult(
+            plan=TrendingQueryPlan(
+                requested_window=window,
+                resolved_window="daily" if window == "daily" else "weekly",
+                source_mode="official_trending_page",
+                source_label="GitHub 官方 Trending 页面（日榜）",
+                is_official=True,
+            ),
+            repositories=self.repositories[:limit],
+        )
 
 
 class FakeIntelligenceAgent:
@@ -143,3 +156,42 @@ def test_trending_collector_prefers_repo_link_over_sponsor_link_and_parses_count
     assert repository.stars == 46744
     assert repository.forks == 3799
     assert repository.stars_in_period == "7,280"
+
+
+def test_trending_collector_marks_custom_day_window_as_unsupported() -> None:
+    collector = GitHubTrendingCollector(
+        client=type(
+            "DummyClient",
+            (),
+            {"get": lambda self, path, **kwargs: type("Resp", (), {"status_code": 404, "text": "", "raise_for_status": lambda self: None})()},
+        )()
+    )
+
+    result = collector.collect_with_metadata("14d", 5)
+
+    assert result.repositories == []
+    assert result.plan.resolved_window is None
+    assert "只稳定提供 daily、weekly、monthly" in str(result.plan.unsupported_reason)
+
+
+def test_trending_service_explains_unsupported_custom_window() -> None:
+    class UnsupportedCollector:
+        def collect_with_metadata(self, window: str, limit: int):
+            return TrendingQueryResult(
+                plan=TrendingQueryPlan(
+                    requested_window=window,
+                    resolved_window=None,
+                    source_mode="unsupported",
+                    source_label="当前未提供替代口径",
+                    is_official=False,
+                    unsupported_reason="GitHub 官方 Trending 页面当前只稳定提供 daily、weekly、monthly 三种时间窗口。",
+                ),
+                repositories=[],
+            )
+
+    service = GitHubTrendingService(collector=UnsupportedCollector(), agent=FakeIntelligenceAgent())
+
+    report = service.get_trending("14d", 10)
+
+    assert "当前请求无法按官方 Trending 口径执行" in report
+    assert "daily / 7d / 30d" in report
