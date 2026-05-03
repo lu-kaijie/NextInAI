@@ -114,21 +114,29 @@ def build_harness_tool_registry(
     registry.register(
         QueryEventsTool(
             name="resolve_event_reference",
-            description="把上一轮结果中的 reference_index 解析为真实 event_id，用于后续详情查看或导出。",
+            description="把上一轮结果中的语义选择解析为真实 event_id，用于后续详情查看或导出。",
             intent="resolve_reference",
-            input_schema={"reference_index": "int"},
+            input_schema={"selection": "dict"},
             output_schema={"resolved": "bool", "event_id": "optional str", "message": "str"},
-            handler=lambda context, payload: _resolve_event_reference(storage, context, payload["reference_index"]),
+            handler=lambda context, payload: _resolve_event_reference(
+                storage,
+                context,
+                payload["selection"],
+            ),
         )
     )
     registry.register(
         QueryEventsTool(
             name="resolve_delivery_task_reference",
-            description="把上一轮任务列表中的 reference_index 解析为真实 task_id，用于删除任务。",
+            description="把上一轮任务列表中的语义选择解析为真实 task_id，用于删除任务。",
             intent="resolve_reference",
-            input_schema={"reference_index": "int"},
+            input_schema={"selection": "dict"},
             output_schema={"resolved": "bool", "task_id": "optional str", "message": "str"},
-            handler=lambda context, payload: _resolve_delivery_task_reference(storage, context, payload["reference_index"]),
+            handler=lambda context, payload: _resolve_delivery_task_reference(
+                storage,
+                context,
+                payload["selection"],
+            ),
         )
     )
     registry.register(
@@ -147,9 +155,9 @@ def build_harness_tool_registry(
             description="把 event_id 或上一轮结果编号解析为 report_id，用于导出单条报告详细解读。",
             intent="resolve_reference",
             input_schema={
-                "reference_index": "optional int",
                 "event_id": "optional str",
                 "report_id": "optional str",
+                "selection": "optional dict",
             },
             output_schema={"resolved": "bool", "report_id": "optional str", "message": "str"},
             handler=lambda context, payload: _prepare_report_export(storage, context, payload),
@@ -375,41 +383,59 @@ def _load_session_state(storage: FileStorage, session_id: str | None) -> dict[st
     return {}
 
 
-def _resolve_event_reference(storage: FileStorage, context: RunContext, reference_index: int) -> dict[str, Any]:
+def _resolve_event_reference(
+    storage: FileStorage,
+    context: RunContext,
+    selection: dict[str, Any],
+) -> dict[str, Any]:
+    reference_index, reference_mode = _parse_selection(selection)
     state = _load_session_state(storage, context.session_id)
     reference_map = dict(state.get("reference_map") or {})
-    event_id = reference_map.get(str(reference_index))
+    resolved_index = _resolve_reference_position(reference_map, reference_index, reference_mode)
+    event_id = reference_map.get(str(resolved_index))
     if not event_id:
         return {
             "resolved": False,
             "message": "没有定位到对应事件。请先获取列表，或改为提供明确的 event_id。",
             "reference_index": reference_index,
+            "reference_mode": reference_mode,
         }
     event = _find_event_by_id(storage, event_id)
     return {
         "resolved": True,
         "reference_index": reference_index,
+        "resolved_index": resolved_index,
+        "reference_mode": reference_mode,
         "event_id": event_id,
         "report_id": _extract_report_id_from_event(event),
-        "message": f"已解析第 {reference_index} 项对应的 event_id。",
+        "message": f"已解析{'倒数' if reference_mode == 'from_end' else ''}第 {reference_index} 项对应的 event_id。",
     }
 
 
-def _resolve_delivery_task_reference(storage: FileStorage, context: RunContext, reference_index: int) -> dict[str, Any]:
+def _resolve_delivery_task_reference(
+    storage: FileStorage,
+    context: RunContext,
+    selection: dict[str, Any],
+) -> dict[str, Any]:
+    reference_index, reference_mode = _parse_selection(selection)
     state = _load_session_state(storage, context.session_id)
     reference_map = dict(state.get("reference_map") or {})
-    task_id = reference_map.get(str(reference_index))
+    resolved_index = _resolve_reference_position(reference_map, reference_index, reference_mode)
+    task_id = reference_map.get(str(resolved_index))
     if not task_id:
         return {
             "resolved": False,
             "message": "没有定位到对应任务。请先列出任务，或改为提供明确的 task_id。",
             "reference_index": reference_index,
+            "reference_mode": reference_mode,
         }
     return {
         "resolved": True,
         "reference_index": reference_index,
+        "resolved_index": resolved_index,
+        "reference_mode": reference_mode,
         "task_id": task_id,
-        "message": f"已解析第 {reference_index} 个任务对应的 task_id。",
+        "message": f"已解析{'倒数' if reference_mode == 'from_end' else ''}第 {reference_index} 个任务对应的 task_id。",
     }
 
 
@@ -458,9 +484,9 @@ def _prepare_report_export(storage: FileStorage, context: RunContext, payload: d
                 "report_id": resolved_report_id,
                 "message": "已从 event_id 解析出 report_id。",
             }
-    reference_index = payload.get("reference_index")
-    if isinstance(reference_index, int):
-        resolved = _resolve_event_reference(storage, context, reference_index)
+    selection = payload.get("selection")
+    if isinstance(selection, dict):
+        resolved = _resolve_event_reference(storage, context, selection)
         event_id = resolved.get("event_id")
         if isinstance(event_id, str):
             event = _find_event_by_id(storage, event_id)
@@ -468,7 +494,7 @@ def _prepare_report_export(storage: FileStorage, context: RunContext, payload: d
             if resolved_report_id:
                 return {
                     "resolved": True,
-                    "reference_index": reference_index,
+                    "selection": selection,
                     "event_id": event_id,
                     "report_id": resolved_report_id,
                     "message": "已从上一轮结果解析出 report_id。",
@@ -497,6 +523,28 @@ def _extract_report_id_from_event(event: dict[str, Any] | None) -> str | None:
         if isinstance(content_ref, str) and content_ref:
             return f"report:{content_ref}"
     return None
+
+
+def _resolve_reference_position(reference_map: dict[str, str], reference_index: int, reference_mode: str) -> int:
+    if reference_mode != "from_end":
+        return reference_index
+    total = len(reference_map)
+    if total <= 0:
+        return reference_index
+    return total - reference_index + 1
+
+
+def _parse_selection(selection: dict[str, Any]) -> tuple[int, str]:
+    strategy = str(selection.get("strategy") or "ordinal").strip()
+    if strategy != "ordinal":
+        raise ValueError(f"暂不支持的 selection.strategy：{strategy}")
+    raw_index = selection.get("index")
+    if not isinstance(raw_index, int) or isinstance(raw_index, bool) or raw_index <= 0:
+        raise ValueError("selection.index 必须是正整数。")
+    direction = str(selection.get("direction") or "from_start").strip()
+    if direction not in {"from_start", "from_end"}:
+        raise ValueError("selection.direction 必须是 from_start 或 from_end。")
+    return raw_index, direction
 
 
 def _event_from_dict(payload: dict[str, Any]):

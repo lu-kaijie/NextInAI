@@ -158,7 +158,7 @@ def test_assistant_agent_queries_reports_and_supports_detail_followup(tmp_path) 
             [
                 [("get_report_events", {"limit": 1}, "query_intelligence")],
                 [
-                    ("resolve_event_reference", {"reference_index": 1}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 1, "direction": "from_start"}}, "resolve_reference"),
                     ("get_event_detail", lambda messages: {"event_id": _last_tool_output(messages)["event_id"]}, "explore_detail"),
                 ],
             ]
@@ -237,7 +237,7 @@ def test_assistant_agent_supports_chinese_ordinal_reference(tmp_path) -> None:
             [
                 [("get_report_events", {"limit": 3}, "query_intelligence")],
                 [
-                    ("resolve_event_reference", {"reference_index": 3}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 3, "direction": "from_start"}}, "resolve_reference"),
                     ("get_event_detail", lambda messages: {"event_id": _last_tool_output(messages)["event_id"]}, "explore_detail"),
                 ],
             ]
@@ -253,9 +253,135 @@ def test_assistant_agent_supports_chinese_ordinal_reference(tmp_path) -> None:
     assert "核心解读" in second.message
 
 
+def test_assistant_agent_supports_reverse_ordinal_reference(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    content_items = []
+    analysis_results = []
+    for index in range(1, 11):
+        content_items.append(
+            {
+                "source_kind": "ai_report",
+                "subject": "GitHub Trending",
+                "source_key": "GitHub Trending",
+                "signal_type": "trend_snapshot",
+                "title": f"Repo {index}",
+                "url": f"https://example.com/{index}",
+                "published_at": "2026-04-30T00:00:00+00:00",
+                "summary_text": f"summary {index}",
+                "body_text": f"body {index}",
+                "metadata_json": {},
+                "dedupe_fingerprint": f"repo-{index}",
+                "partial": False,
+            }
+        )
+        analysis_results.append(
+            {
+                "analysis_kind": "report_interpretation",
+                "source_ref": f"report:repo-{index}",
+                "title": f"Repo {index}",
+                "factual_summary": f"事实 {index}",
+                "interpreted_summary": f"解读 {index}",
+                "evidence_json": [],
+                "is_partial": False,
+            }
+        )
+    storage.save_collection("content_items", content_items)
+    storage.save_collection("analysis_results", analysis_results)
+    agent = AssistantAgent(
+        storage=storage,
+        intent_planner=SequencedPlanner(
+            [
+                [("get_report_events", {"limit": 10}, "query_intelligence")],
+                [
+                    (
+                        "resolve_event_reference",
+                        {"selection": {"strategy": "ordinal", "index": 3, "direction": "from_end"}},
+                        "resolve_reference",
+                    ),
+                    ("get_event_detail", lambda messages: {"event_id": _last_tool_output(messages)["event_id"]}, "explore_detail"),
+                ],
+            ]
+        ),
+    )
+
+    first = agent.respond("给我最近 10 个项目", session_id="session-reverse-ordinal")
+    second = agent.respond("倒数第三个详细讲讲", session_id="session-reverse-ordinal")
+
+    assert "最值得注意" in first.message
+    assert "Repo 8" in second.message
+    assert "Repo 7" not in second.message
+
+
+def test_assistant_agent_keeps_list_reference_context_after_detail_followup(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    content_items = []
+    analysis_results = []
+    for index in range(1, 6):
+        content_items.append(
+            {
+                "source_kind": "ai_report",
+                "subject": "GitHub Trending",
+                "source_key": "GitHub Trending",
+                "signal_type": "trend_snapshot",
+                "title": f"Repo {index}",
+                "url": f"https://example.com/{index}",
+                "published_at": "2026-04-30T00:00:00+00:00",
+                "summary_text": f"summary {index}",
+                "body_text": f"body {index}",
+                "metadata_json": {},
+                "dedupe_fingerprint": f"repo-keep-{index}",
+                "partial": False,
+            }
+        )
+        analysis_results.append(
+            {
+                "analysis_kind": "report_interpretation",
+                "source_ref": f"report:repo-keep-{index}",
+                "title": f"Repo {index}",
+                "factual_summary": f"事实 {index}",
+                "interpreted_summary": f"解读 {index}",
+                "evidence_json": [],
+                "is_partial": False,
+            }
+        )
+    storage.save_collection("content_items", content_items)
+    storage.save_collection("analysis_results", analysis_results)
+    agent = AssistantAgent(
+        storage=storage,
+        intent_planner=SequencedPlanner(
+            [
+                [("get_report_events", {"limit": 5}, "query_intelligence")],
+                [
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 5, "direction": "from_start"}}, "resolve_reference"),
+                    ("get_event_detail", lambda messages: {"event_id": _last_tool_output(messages)["event_id"]}, "explore_detail"),
+                ],
+                [
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 2, "direction": "from_end"}}, "resolve_reference"),
+                    ("get_event_detail", lambda messages: {"event_id": _last_tool_output(messages)["event_id"]}, "explore_detail"),
+                ],
+            ]
+        ),
+    )
+
+    session_id = "session-keep-list-context"
+    first = agent.respond("给我最近 5 个项目", session_id=session_id)
+    detail = agent.respond("最后一个详细说说", session_id=session_id)
+    followup = agent.respond("倒数第二个也详细说说", session_id=session_id)
+
+    assert "最值得注意" in first.message
+    assert "Repo 5" in detail.message
+    assert "Repo 4" in followup.message
+
+
 def test_assistant_agent_returns_explicit_message_when_reference_resolution_fails(tmp_path) -> None:
     storage = FileStorage(tmp_path)
-    agent = AssistantAgent(storage=storage, intent_planner=FakePlanner("resolve_event_reference", {"reference_index": 3}))
+    agent = AssistantAgent(
+        storage=storage,
+        intent_planner=FakePlanner(
+            "resolve_event_reference",
+            {"selection": {"strategy": "ordinal", "index": 3, "direction": "from_start"}},
+        ),
+    )
 
     response = agent.respond("第三个详细讲讲", session_id="session-missing-ref")
 
@@ -331,7 +457,11 @@ def test_assistant_agent_lists_and_deletes_tasks(tmp_path) -> None:
             [
                 [("get_delivery_tasks", {}, "query_intelligence")],
                 [
-                    ("resolve_delivery_task_reference", {"reference_index": 1}, "resolve_reference"),
+                    (
+                        "resolve_delivery_task_reference",
+                        {"selection": {"strategy": "ordinal", "index": 1, "direction": "from_start"}},
+                        "resolve_reference",
+                    ),
                     (
                         "delete_delivery_task",
                         lambda messages: {"task_id": _last_tool_output(messages)["task_id"]},
@@ -587,6 +717,25 @@ def test_assistant_agent_stops_on_repeated_tool_call(tmp_path) -> None:
     assert "重复工具调用" in response.message
 
 
+def test_assistant_agent_returns_validation_error_instead_of_generic_repeat_on_duplicate_invalid_call(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    agent = AssistantAgent(
+        storage=storage,
+        intent_planner=SequencedPlanner(
+            [
+                [
+                    ("resolve_event_reference", {}, "resolve_reference"),
+                    ("resolve_event_reference", {}, "resolve_reference"),
+                ]
+            ]
+        ),
+    )
+
+    response = agent.respond("倒数第二个详细说说", session_id="session-duplicate-invalid")
+
+    assert "缺少必填参数：selection" in response.message
+
+
 def test_assistant_agent_stops_when_step_limit_is_hit(tmp_path) -> None:
     storage = FileStorage(tmp_path)
     agent = AssistantAgent(
@@ -594,14 +743,14 @@ def test_assistant_agent_stops_when_step_limit_is_hit(tmp_path) -> None:
         intent_planner=SequencedPlanner(
             [
                 [
-                    ("resolve_event_reference", {"reference_index": 1}, "resolve_reference"),
-                    ("resolve_event_reference", {"reference_index": 2}, "resolve_reference"),
-                    ("resolve_event_reference", {"reference_index": 3}, "resolve_reference"),
-                    ("resolve_event_reference", {"reference_index": 4}, "resolve_reference"),
-                    ("resolve_event_reference", {"reference_index": 5}, "resolve_reference"),
-                    ("resolve_event_reference", {"reference_index": 6}, "resolve_reference"),
-                    ("resolve_event_reference", {"reference_index": 7}, "resolve_reference"),
-                    ("resolve_event_reference", {"reference_index": 8}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 1, "direction": "from_start"}}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 2, "direction": "from_start"}}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 3, "direction": "from_start"}}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 4, "direction": "from_start"}}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 5, "direction": "from_start"}}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 6, "direction": "from_start"}}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 7, "direction": "from_start"}}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 8, "direction": "from_start"}}, "resolve_reference"),
                 ]
             ]
         ),
@@ -718,11 +867,11 @@ def test_assistant_agent_can_export_report_detail_from_chat(tmp_path, monkeypatc
             [
                 [("get_report_events", {"limit": 1}, "query_intelligence")],
                 [
-                    ("resolve_event_reference", {"reference_index": 1}, "resolve_reference"),
+                    ("resolve_event_reference", {"selection": {"strategy": "ordinal", "index": 1, "direction": "from_start"}}, "resolve_reference"),
                     ("get_event_detail", lambda messages: {"event_id": _last_tool_output(messages)["event_id"]}, "explore_detail"),
                 ],
                 [
-                    ("prepare_report_export", {"reference_index": 1}, "resolve_reference"),
+                    ("prepare_report_export", {"selection": {"strategy": "ordinal", "index": 1, "direction": "from_start"}}, "resolve_reference"),
                     (
                         "export_report",
                         lambda messages: {"report_id": _last_tool_output(messages)["report_id"], "formats": ["md"]},

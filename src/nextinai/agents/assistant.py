@@ -50,6 +50,8 @@ class OpenAIIntentPlanner:
             "不要依赖关键词匹配思维，不要假装已经完成未执行的动作。"
             "你必须显式给出工具参数，不能把时间窗口、数量、导出格式、仓库名、报告来源、scope、view、target 留给程序猜。"
             "如果缺少 event_id、task_id、report_id 或简报 events，请先调用 resolver / prepare 类工具，不要假设程序会自动补齐。"
+            "当需要从上一轮结果里选对象时，请传递语义化 selection 对象，由你自己推断 index、direction 等参数，不要依赖程序理解用户原话。"
+            "selection 对象必须明确包含 strategy、index、direction 三个字段。"
             "如果需要查看列表、展开细节、生成简报、导出、发送通知或管理任务，就主动选择工具。"
             "涉及外发、订阅修改、任务创建/删除等副作用动作时，也照常选择工具，系统会负责确认门。"
             "如果用户是在追问上一轮结果，请优先调用 reference resolver 工具取得真实目标，再调用业务工具。"
@@ -118,13 +120,25 @@ class OpenAIIntentPlanner:
                 "type": "function",
                 "function": {
                     "name": "resolve_event_reference",
-                    "description": "把上一轮结果中的第 N 个解析成真实 event_id，可用于详情查看或报告导出。",
+                    "description": "把上一轮结果中的语义选择解析成真实 event_id，可用于详情查看或报告导出。selection 由模型根据用户表达自行推断。",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "reference_index": {"type": "integer", "description": "上一轮结果中的编号，如第 2 个就是 2。"},
+                            "selection": {
+                                "type": "object",
+                                "description": "语义选择对象。",
+                                "properties": {
+                                    "strategy": {"type": "string", "description": "固定传 ordinal。"},
+                                    "index": {"type": "integer", "description": "第几个，必须是正整数。"},
+                                    "direction": {
+                                        "type": "string",
+                                        "description": "from_start 表示正数第 N 个，from_end 表示倒数第 N 个。",
+                                    },
+                                },
+                                "required": ["strategy", "index", "direction"],
+                            },
                         },
-                        "required": ["reference_index"],
+                        "required": ["selection"],
                     },
                 },
             },
@@ -132,13 +146,25 @@ class OpenAIIntentPlanner:
                 "type": "function",
                 "function": {
                     "name": "resolve_delivery_task_reference",
-                    "description": "把上一轮任务列表中的第 N 个解析成真实 task_id，用于删除任务。",
+                    "description": "把上一轮任务列表中的语义选择解析成真实 task_id，用于删除任务。selection 由模型根据用户表达自行推断。",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "reference_index": {"type": "integer", "description": "上一轮任务列表中的编号。"},
+                            "selection": {
+                                "type": "object",
+                                "description": "语义选择对象。",
+                                "properties": {
+                                    "strategy": {"type": "string", "description": "固定传 ordinal。"},
+                                    "index": {"type": "integer", "description": "第几个，必须是正整数。"},
+                                    "direction": {
+                                        "type": "string",
+                                        "description": "from_start 表示正数第 N 个，from_end 表示倒数第 N 个。",
+                                    },
+                                },
+                                "required": ["strategy", "index", "direction"],
+                            },
                         },
-                        "required": ["reference_index"],
+                        "required": ["selection"],
                     },
                 },
             },
@@ -161,13 +187,25 @@ class OpenAIIntentPlanner:
                 "type": "function",
                 "function": {
                     "name": "prepare_report_export",
-                    "description": "把 report_id、event_id 或上一轮第 N 个结果解析成真实 report_id，用于 export_report。",
+                    "description": "把 report_id、event_id 或语义选择解析成真实 report_id，用于 export_report。",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "report_id": {"type": "string", "description": "已知 report_id 时直接传。"},
                             "event_id": {"type": "string", "description": "已知 event_id 时可传。"},
-                            "reference_index": {"type": "integer", "description": "上一轮结果编号。"},
+                            "selection": {
+                                "type": "object",
+                                "description": "语义选择对象；当用户引用上一轮列表中的某个对象时使用。",
+                                "properties": {
+                                    "strategy": {"type": "string", "description": "固定传 ordinal。"},
+                                    "index": {"type": "integer", "description": "第几个，必须是正整数。"},
+                                    "direction": {
+                                        "type": "string",
+                                        "description": "from_start 表示正数第 N 个，from_end 表示倒数第 N 个。",
+                                    },
+                                },
+                                "required": ["strategy", "index", "direction"],
+                            },
                         },
                     },
                 },
@@ -369,6 +407,7 @@ class OpenAIIntentPlanner:
             f"last_intent={state.last_intent}, "
             f"last_query={state.last_query}, "
             f"last_event_ids={state.last_event_ids[:5]}, "
+            f"current_event_id={state.current_event_id}, "
             f"reference_map={state.reference_map}, "
             f"pending_tool={state.pending_tool_name}"
         )
@@ -517,6 +556,8 @@ class AssistantAgent:
                         tool=decision.tool_name,
                         step=step + 1,
                     )
+                    if final_response is not None and final_response.error:
+                        return final_response
                     return AssistantResponse(
                         message="agent loop 检测到重复工具调用且没有新进展，已主动停止。请换个问法或补充更明确的目标。"
                     )
@@ -753,11 +794,22 @@ class AssistantAgent:
         state.pending_tool_name = None
         state.pending_tool_input = None
         if decision.tool_name in {"get_trending_events", "get_repo_update_events", "get_report_events"}:
-            events = output.get("events") or []
-            state.last_event_ids = [event["event_id"] for event in events]
-            state.reference_map = {str(index): event["event_id"] for index, event in enumerate(events, start=1)}
-            if events:
-                state.last_subject = events[0].get("subject")
+            displayed_event_ids = list(response.referenced_event_ids)
+            all_events = output.get("events") or []
+            event_index = {
+                event["event_id"]: event
+                for event in all_events
+                if isinstance(event, dict) and event.get("event_id")
+            }
+            displayed_events = [event_index[event_id] for event_id in displayed_event_ids if event_id in event_index]
+            state.last_event_ids = displayed_event_ids
+            state.reference_map = {
+                str(index): event_id
+                for index, event_id in enumerate(displayed_event_ids, start=1)
+            }
+            if displayed_events:
+                state.last_subject = displayed_events[0].get("subject")
+            state.current_event_id = displayed_event_ids[0] if displayed_event_ids else None
             state.last_query = dict(decision.tool_input)
             state.last_query["tool_name"] = decision.tool_name
         elif decision.tool_name == "render_briefing_preview":
@@ -767,12 +819,12 @@ class AssistantAgent:
         elif decision.tool_name == "get_delivery_tasks":
             tasks = output.get("tasks") or []
             state.reference_map = {str(index): task["task_id"] for index, task in enumerate(tasks, start=1)}
+            state.current_event_id = None
             state.last_query = {"tool_name": decision.tool_name}
         elif decision.tool_name == "get_event_detail":
             event = output.get("event")
             if event:
-                state.last_event_ids = [event["event_id"]]
-                state.reference_map = {"1": event["event_id"]}
+                state.current_event_id = event["event_id"]
                 state.last_subject = event.get("subject")
                 state.last_query = {
                     "tool_name": decision.tool_name,
@@ -786,6 +838,7 @@ class AssistantAgent:
             if events:
                 state.reference_map = {str(index): event["event_id"] for index, event in enumerate(events, start=1)}
                 state.last_subject = events[0].get("subject")
+                state.current_event_id = events[0]["event_id"]
             state.last_query = {
                 "tool_name": decision.tool_name,
                 "scope": output.get("scope"),
