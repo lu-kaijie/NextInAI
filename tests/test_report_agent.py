@@ -1,4 +1,4 @@
-from nextinai.agents import ReportInterpretation, TrendingProjectAnalysis
+from nextinai.agents import DeepReportReading, ReportInterpretation, TrendingProjectAnalysis
 from nextinai.collectors.reports import CollectedReportItem, ReportSource
 from nextinai.services.report_agent import AgenticReportService
 from nextinai.storage.files import FileStorage
@@ -16,7 +16,20 @@ class FakeReportCollector:
         return self.items
 
 
+class FakeAnthropicCollector:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def collect(self, source: ReportSource, progress_callback=None):
+        self.calls.append((source.name, source.kind, source.url))
+        return []
+
+
 class FakeInterpreter:
+    def __init__(self) -> None:
+        self.deep_read_calls = 0
+        self.translate_calls = 0
+
     def summarize_repository_updates(self, *, repository, hours, items):
         return "unused"
 
@@ -30,6 +43,21 @@ class FakeInterpreter:
             evidence=[url],
             is_partial=not bool(body_text),
         )
+
+    def deep_read_report(self, *, title, source_name, url, summary_text, body_text):
+        self.deep_read_calls += 1
+        return DeepReportReading(
+            markdown_body=f"# {title} 深度带读\n\n## 先说结论\n这是 {source_name} 的详细解读。",
+            summary=f"{title} 的详细解读",
+            evidence=[url],
+            is_partial=not bool(body_text),
+        )
+
+    def translate_report_excerpt(self, *, title, source_name, excerpt_text):
+        self.translate_calls += 1
+        if "这是中文" in excerpt_text:
+            return excerpt_text
+        return f"这是一段流畅的中文译文：{title}"
 
 
 def test_report_service_collects_and_interprets_reports(tmp_path) -> None:
@@ -64,6 +92,46 @@ def test_report_service_collects_and_interprets_reports(tmp_path) -> None:
     assert len(analysis_results) == 1
     assert analysis_results[0]["factual_summary"] == "事实：Introducing a new agent workflow"
     assert analysis_results[0]["interpreted_summary"] == "解读：OpenAI News"
+
+
+def test_anthropic_source_uses_webpage_index_mode(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    collector = FakeAnthropicCollector()
+    service = AgenticReportService(
+        storage=storage,
+        collector=collector,
+        agent=FakeInterpreter(),
+        sources=[ReportSource("Anthropic News", "company", "webpage_index", "https://www.anthropic.com/news", category="AI 公司")],
+    )
+
+    message = service.fetch_reports("company")
+
+    assert "报告采集完成" in message
+    assert collector.calls == [("Anthropic News", "webpage_index", "https://www.anthropic.com/news")]
+
+
+def test_cohere_research_source_can_be_registered(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    collector = FakeAnthropicCollector()
+    service = AgenticReportService(
+        storage=storage,
+        collector=collector,
+        agent=FakeInterpreter(),
+        sources=[
+            ReportSource(
+                "Cohere Research",
+                "company",
+                "webpage_index",
+                "https://cohere.com/research",
+                category="AI 公司",
+                article_path_prefix="/research/papers/",
+            )
+        ],
+    )
+
+    service.fetch_reports("company")
+
+    assert collector.calls == [("Cohere Research", "webpage_index", "https://cohere.com/research")]
 
 
 def test_report_service_records_skip_for_duplicate_or_unreadable(tmp_path) -> None:
@@ -179,8 +247,8 @@ def test_report_service_lists_sources_reports_and_detail(tmp_path) -> None:
         collector=FakeReportCollector([]),
         agent=FakeInterpreter(),
         sources=[
-            ReportSource("OpenAI News", "default", "feed", "https://example.com/feed.xml"),
-            ReportSource("Hugging Face Blog", "default", "feed", "https://example.com/hf.xml"),
+            ReportSource("OpenAI News", "default", "feed", "https://example.com/feed.xml", category="AI 公司"),
+            ReportSource("Hugging Face Blog", "default", "feed", "https://example.com/hf.xml", category="开源与平台"),
         ],
     )
     report = CollectedReportItem(
@@ -210,12 +278,14 @@ def test_report_service_lists_sources_reports_and_detail(tmp_path) -> None:
         ],
     )
 
-    sources = service.list_sources("default")
-    reports = service.list_reports("OpenAI News", limit=5)
+    sources = service.list_sources(source_category="AI 公司")
+    reports = service.list_reports("OpenAI News", limit=5, source_category="AI 公司")
     detail = service.get_report_detail(f"report:{fingerprint}")
 
-    assert len(sources) == 2
+    assert len(sources) == 1
+    assert sources[0]["category"] == "AI 公司"
     assert reports[0]["title"] == "Agent roadmap update"
+    assert reports[0]["deep_reading_ready"] is False
     assert detail is not None
     assert detail["interpreted_summary"] == "解读：OpenAI News"
 
@@ -302,3 +372,153 @@ def test_report_service_can_export_report_summary(tmp_path) -> None:
 
     assert exported["md"].endswith(".md")
     assert exported["pdf"].endswith(".pdf")
+
+
+def test_report_service_generates_and_reuses_deep_reading(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    interpreter = FakeInterpreter()
+    service = AgenticReportService(
+        storage=storage,
+        collector=FakeReportCollector([]),
+        agent=interpreter,
+        sources=[ReportSource("OpenAI News", "default", "feed", "https://example.com/feed.xml", category="AI 公司")],
+    )
+    report = CollectedReportItem(
+        source_name="OpenAI News",
+        title="Agent roadmap update",
+        url="https://example.com/agent-roadmap",
+        published_at="2026-04-30T00:00:00+00:00",
+        summary_text="roadmap",
+        body_text="details",
+        metadata_json={"group": "default", "category": "AI 公司"},
+        partial=False,
+    )
+    fingerprint = service._build_fingerprint(report)
+    storage.save_collection("content_items", [service._build_content_record(report, fingerprint)])
+    storage.save_collection(
+        "analysis_results",
+        [
+            {
+                "analysis_kind": "report_interpretation",
+                "source_ref": f"report:{fingerprint}",
+                "title": report.title,
+                "factual_summary": "事实：Agent roadmap update",
+                "interpreted_summary": "解读：OpenAI News",
+                "evidence_json": [],
+                "is_partial": False,
+            }
+        ],
+    )
+
+    first = service.generate_deep_report_reading(f"report:{fingerprint}")
+    second = service.generate_deep_report_reading(f"report:{fingerprint}")
+    forced = service.generate_deep_report_reading(f"report:{fingerprint}", force=True)
+
+    assert first["deep_reading_ready"] is True
+    assert "深度带读" in str(first["deep_reading_markdown"])
+    assert second["deep_reading_ready"] is True
+    assert forced["deep_reading_ready"] is True
+    assert interpreter.deep_read_calls == 2
+
+
+def test_report_service_exports_deep_reading_content(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    service = AgenticReportService(
+        storage=storage,
+        collector=FakeReportCollector([]),
+        agent=FakeInterpreter(),
+        sources=[ReportSource("OpenAI News", "default", "feed", "https://example.com/feed.xml", category="AI 公司")],
+    )
+    service.report_output_dir = tmp_path / "artifacts"
+    report = CollectedReportItem(
+        source_name="OpenAI News",
+        title="Agent roadmap update",
+        url="https://example.com/agent-roadmap",
+        published_at="2026-04-30T00:00:00+00:00",
+        summary_text="roadmap",
+        body_text="details",
+        metadata_json={"group": "default", "category": "AI 公司"},
+        partial=False,
+    )
+    fingerprint = service._build_fingerprint(report)
+    storage.save_collection("content_items", [service._build_content_record(report, fingerprint)])
+    storage.save_collection(
+        "analysis_results",
+        [
+            {
+                "analysis_kind": "report_interpretation",
+                "source_ref": f"report:{fingerprint}",
+                "title": report.title,
+                "factual_summary": "事实：Agent roadmap update",
+                "interpreted_summary": "解读：OpenAI News",
+                "evidence_json": [],
+                "is_partial": False,
+            }
+        ],
+    )
+    service.generate_deep_report_reading(f"report:{fingerprint}")
+
+    exported = service.export_report(f"report:{fingerprint}", ["md"])
+
+    markdown_path = exported["md"]
+    assert markdown_path.endswith(".md")
+    assert "深度带读" in open(markdown_path, encoding="utf-8").read()
+
+
+def test_report_service_generates_and_reuses_excerpt_translation(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    interpreter = FakeInterpreter()
+    service = AgenticReportService(
+        storage=storage,
+        collector=FakeReportCollector([]),
+        agent=interpreter,
+        sources=[ReportSource("OpenAI News", "default", "feed", "https://example.com/feed.xml", category="AI 公司")],
+    )
+    report = CollectedReportItem(
+        source_name="OpenAI News",
+        title="Agent roadmap update",
+        url="https://example.com/agent-roadmap",
+        published_at="2026-04-30T00:00:00+00:00",
+        summary_text="roadmap",
+        body_text="This post explains a new agent workflow for tool use.",
+        metadata_json={"group": "default", "category": "AI 公司"},
+        partial=False,
+    )
+    fingerprint = service._build_fingerprint(report)
+    storage.save_collection("content_items", [service._build_content_record(report, fingerprint)])
+
+    first = service.generate_report_excerpt_translation(f"report:{fingerprint}")
+    second = service.generate_report_excerpt_translation(f"report:{fingerprint}")
+    forced = service.generate_report_excerpt_translation(f"report:{fingerprint}", force=True)
+
+    assert "流畅的中文译文" in str(first["localized_excerpt_text"])
+    assert second["localized_excerpt_text"] == first["localized_excerpt_text"]
+    assert forced["localized_excerpt_text"] == first["localized_excerpt_text"]
+    assert interpreter.translate_calls == 2
+
+
+def test_report_service_keeps_chinese_excerpt_without_translation_changes(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    interpreter = FakeInterpreter()
+    service = AgenticReportService(
+        storage=storage,
+        collector=FakeReportCollector([]),
+        agent=interpreter,
+        sources=[ReportSource("OpenAI News", "default", "feed", "https://example.com/feed.xml", category="AI 公司")],
+    )
+    report = CollectedReportItem(
+        source_name="OpenAI News",
+        title="中文报告",
+        url="https://example.com/cn-report",
+        published_at="2026-04-30T00:00:00+00:00",
+        summary_text="摘要",
+        body_text="这是中文原文摘录，应该直接展示。",
+        metadata_json={"group": "default", "category": "AI 公司"},
+        partial=False,
+    )
+    fingerprint = service._build_fingerprint(report)
+    storage.save_collection("content_items", [service._build_content_record(report, fingerprint)])
+
+    detail = service.generate_report_excerpt_translation(f"report:{fingerprint}")
+
+    assert detail["localized_excerpt_text"] == "这是中文原文摘录，应该直接展示。"

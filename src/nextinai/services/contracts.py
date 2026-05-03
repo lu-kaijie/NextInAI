@@ -51,13 +51,32 @@ class ReportService:
     def fetch_reports(self, source_group: str, progress_callback=None) -> str:
         raise NotImplementedError
 
-    def list_sources(self, source_group: str | None = None) -> list[dict[str, str | int | None]]:
+    def list_sources(
+        self,
+        source_group: str | None = None,
+        source_category: str | None = None,
+    ) -> list[dict[str, str | int | bool | None]]:
         raise NotImplementedError
 
-    def list_reports(self, source_name: str | None = None, limit: int = 10) -> list[dict[str, str | bool | None]]:
+    def list_reports(
+        self,
+        source_name: str | None = None,
+        limit: int = 10,
+        source_category: str | None = None,
+    ) -> list[dict[str, str | bool | None]]:
         raise NotImplementedError
 
     def get_report_detail(self, report_id: str) -> dict[str, str | bool | None] | None:
+        raise NotImplementedError
+
+    def generate_deep_report_reading(self, report_id: str, force: bool = False) -> dict[str, str | bool | None]:
+        raise NotImplementedError
+
+    def generate_report_excerpt_translation(
+        self,
+        report_id: str,
+        force: bool = False,
+    ) -> dict[str, str | bool | None]:
         raise NotImplementedError
 
     def export_report(self, report_id: str, formats: list[str]) -> dict[str, str]:
@@ -68,6 +87,7 @@ class ReportService:
         source_name: str | None,
         limit: int,
         formats: list[str],
+        source_category: str | None = None,
     ) -> dict[str, str]:
         raise NotImplementedError
 
@@ -156,13 +176,32 @@ class CapabilityService:
     def fetch_reports(self, source_group: str, progress_callback=None) -> str:
         raise NotImplementedError
 
-    def list_report_sources(self, source_group: str | None = None) -> list[dict[str, str | int | None]]:
+    def list_report_sources(
+        self,
+        source_group: str | None = None,
+        source_category: str | None = None,
+    ) -> list[dict[str, str | int | bool | None]]:
         raise NotImplementedError
 
-    def list_reports(self, source_name: str | None = None, limit: int = 10) -> list[dict[str, str | bool | None]]:
+    def list_reports(
+        self,
+        source_name: str | None = None,
+        limit: int = 10,
+        source_category: str | None = None,
+    ) -> list[dict[str, str | bool | None]]:
         raise NotImplementedError
 
     def get_report_detail(self, report_id: str) -> dict[str, str | bool | None] | None:
+        raise NotImplementedError
+
+    def generate_deep_report_reading(self, report_id: str, force: bool = False) -> dict[str, str | bool | None]:
+        raise NotImplementedError
+
+    def generate_report_excerpt_translation(
+        self,
+        report_id: str,
+        force: bool = False,
+    ) -> dict[str, str | bool | None]:
         raise NotImplementedError
 
     def export_report(self, report_id: str, formats: list[str]) -> dict[str, str]:
@@ -173,6 +212,7 @@ class CapabilityService:
         source_name: str | None,
         limit: int,
         formats: list[str],
+        source_category: str | None = None,
     ) -> dict[str, str]:
         raise NotImplementedError
 

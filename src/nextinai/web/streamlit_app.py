@@ -15,6 +15,12 @@ from nextinai.scheduler import DeliveryTaskScheduler
 from nextinai.services.registry import build_service_registry
 from nextinai.services.task_store import DeliveryTaskStore
 from nextinai.storage.files import FileStorage, ensure_workspace
+from nextinai.web.report_workbench import (
+    build_source_category_options,
+    build_source_name_options,
+    chunk_reports,
+    group_sources_by_category,
+)
 
 
 def _build_storage() -> FileStorage:
@@ -33,7 +39,9 @@ def _ensure_state() -> None:
     if "runtime_logs" not in st.session_state:
         st.session_state.runtime_logs = []
     if "selected_report_source" not in st.session_state:
-        st.session_state.selected_report_source = "全部"
+        st.session_state.selected_report_source = "全部来源"
+    if "selected_report_category" not in st.session_state:
+        st.session_state.selected_report_category = "全部分类"
     if "selected_report_id" not in st.session_state:
         st.session_state.selected_report_id = None
 
@@ -41,6 +49,27 @@ def _ensure_state() -> None:
 def _append_runtime_log(message: str) -> None:
     st.session_state.runtime_logs.append(message)
     st.session_state.runtime_logs = st.session_state.runtime_logs[-200:]
+
+
+def _open_report_detail_page(report_id: str, auto_generate: bool = False) -> None:
+    st.session_state.selected_report_id = report_id
+    st.query_params["page"] = "report-detail"
+    st.query_params["report_id"] = report_id
+    if auto_generate:
+        st.query_params["auto_generate"] = "1"
+    elif "auto_generate" in st.query_params:
+        del st.query_params["auto_generate"]
+    st.rerun()
+
+
+def _close_report_detail_page() -> None:
+    if "page" in st.query_params:
+        del st.query_params["page"]
+    if "report_id" in st.query_params:
+        del st.query_params["report_id"]
+    if "auto_generate" in st.query_params:
+        del st.query_params["auto_generate"]
+    st.rerun()
 
 
 def _render_sidebar(storage: FileStorage) -> None:
@@ -61,6 +90,7 @@ def _render_sidebar(storage: FileStorage) -> None:
             "subscriptions",
             "content_items",
             "analysis_results",
+            "deep_report_readings",
             "events",
             "delivery_tasks",
             "deliveries",
@@ -254,6 +284,106 @@ def _render_trending_tab(capability_service) -> None:
                 st.json(exported)
 
 
+def _render_report_detail_page(capability_service) -> None:
+    report_id = str(st.query_params.get("report_id", st.session_state.selected_report_id or "")).strip()
+    if not report_id:
+        st.warning("缺少报告标识，无法打开详细页。")
+        if st.button("返回报告页", use_container_width=True):
+            _close_report_detail_page()
+        return
+
+    st.session_state.selected_report_id = report_id
+    detail = capability_service.get_report_detail(report_id)
+    if detail is None:
+        st.error("未找到这篇报告，可能筛选条件变化或本地数据已被清理。")
+        if st.button("返回报告页", use_container_width=True):
+            _close_report_detail_page()
+        return
+
+    auto_generate = str(st.query_params.get("auto_generate", "")).strip() == "1"
+    if auto_generate and not detail.get("deep_reading_ready"):
+        with st.spinner("正在生成详细解读..."):
+            detail = capability_service.generate_deep_report_reading(report_id, force=False)
+        if "auto_generate" in st.query_params:
+            del st.query_params["auto_generate"]
+
+    if detail.get("body_text") and not detail.get("localized_excerpt_text"):
+        with st.spinner("正在生成正文摘录中文译文..."):
+            detail = capability_service.generate_report_excerpt_translation(report_id, force=False)
+
+    back_col, open_col = st.columns([1, 1])
+    with back_col:
+        if st.button("返回报告总览", use_container_width=True):
+            _close_report_detail_page()
+    with open_col:
+        st.link_button("打开原文", str(detail["url"]), use_container_width=True)
+
+    st.title(str(detail["title"]))
+    st.caption(
+        f"{detail['source_name']} | {detail.get('source_category') or '未分类'} | "
+        f"{detail.get('published_at') or '未知时间'}"
+    )
+
+    meta_cols = st.columns(4)
+    meta_cols[0].metric("来源", str(detail["source_name"]))
+    meta_cols[1].metric("分类", str(detail.get("source_category") or "未分类"))
+    meta_cols[2].metric("发布时间", str(detail.get("published_at") or "未知"))
+    meta_cols[3].metric("深读状态", "已生成" if detail.get("deep_reading_ready") else "未生成")
+
+    action_cols = st.columns(3)
+    with action_cols[0]:
+        if st.button("生成 / 刷新详细解读", key="detail-refresh-deep", use_container_width=True):
+            _append_runtime_log(f"[report] 强制刷新详细解读：{report_id}")
+            with st.spinner("正在生成详细解读..."):
+                detail = capability_service.generate_deep_report_reading(report_id, force=True)
+            st.success("详细解读已刷新。")
+    with action_cols[1]:
+        if st.button(
+            "导出详细解读 Markdown",
+            key="detail-export-md",
+            use_container_width=True,
+            disabled=not bool(detail.get("deep_reading_ready")),
+        ):
+            exported = capability_service.export_report(report_id, ["md"])
+            st.success("详细解读 Markdown 导出完成")
+            st.json(exported)
+    with action_cols[2]:
+        if st.button(
+            "导出详细解读 PDF",
+            key="detail-export-pdf",
+            use_container_width=True,
+            disabled=not bool(detail.get("deep_reading_ready")),
+        ):
+            exported = capability_service.export_report(report_id, ["pdf"])
+            st.success("详细解读 PDF 导出完成")
+            st.json(exported)
+
+    detail_tabs = st.tabs(["快速概览", "详细解读", "正文翻译"])
+    with detail_tabs[0]:
+        st.write(f"快速概览：{detail.get('overview_summary') or '暂无'}")
+        st.write(f"事实摘要：{detail.get('factual_summary') or detail.get('summary_text') or '暂无'}")
+        st.write(f"概览解读：{detail.get('interpreted_summary') or '暂无'}")
+    with detail_tabs[1]:
+        if detail.get("deep_reading_markdown"):
+            st.markdown(str(detail["deep_reading_markdown"]))
+        else:
+            st.info("这篇报告还没有生成详细解读。点击上方按钮后，系统会按需生成长篇带读。")
+    with detail_tabs[2]:
+        if detail.get("body_text"):
+            excerpt_action_cols = st.columns(2)
+            with excerpt_action_cols[0]:
+                if st.button("刷新正文翻译", key="detail-refresh-excerpt", use_container_width=True):
+                    with st.spinner("正在刷新正文中文翻译..."):
+                        detail = capability_service.generate_report_excerpt_translation(report_id, force=True)
+                    st.success("正文翻译已刷新。")
+            with excerpt_action_cols[1]:
+                generated_at = detail.get("localized_excerpt_generated_at") or "未记录"
+                st.caption(f"正文翻译生成时间：{generated_at}")
+            st.write(detail.get("localized_excerpt_text") or "正文翻译生成中，请稍候。")
+        else:
+            st.info("当前没有可展示的正文内容。")
+
+
 def _render_report_tab(capability_service, storage: FileStorage) -> None:
     st.subheader("AI 报告抓取与解读")
 
@@ -273,84 +403,125 @@ def _render_report_tab(capability_service, storage: FileStorage) -> None:
             st.error(str(exc))
 
     if st.session_state.report_progress:
-        st.markdown("### 抓取进度")
-        st.code("\n".join(st.session_state.report_progress))
+        with st.expander("抓取进度", expanded=False):
+            st.code("\n".join(st.session_state.report_progress))
 
     st.markdown("### 报告来源")
-    source_rows = capability_service.list_report_sources("default")
+    source_rows = capability_service.list_report_sources()
     if source_rows:
-        st.dataframe(source_rows, use_container_width=True)
+        grouped_sources = group_sources_by_category(source_rows)
+        for category, rows in grouped_sources.items():
+            with st.expander(f"{category} ({len(rows)})", expanded=False):
+                for row in rows:
+                    latest = row.get("latest_published_at") or "暂无"
+                    status = "默认抓取" if row.get("default_enabled") else "手动抓取"
+                    st.markdown(f"**{row['source_name']}**")
+                    st.caption(f"{row.get('description') or '暂无描述'}")
+                    st.write(
+                        f"来源组：{row.get('group') or '未标记'} | 报告数：{row.get('report_count') or 0} | "
+                        f"最近发布时间：{latest} | {status}"
+                    )
+                    if row.get("last_issue"):
+                        st.warning(f"最近抓取问题：{row.get('last_issue')}")
+                    st.link_button("打开来源", str(row["url"]), use_container_width=False)
+                    st.divider()
     else:
         st.info("当前还没有可展示的报告来源。")
 
-    source_options = ["全部"] + [str(row["source_name"]) for row in source_rows]
-    selected_source = st.selectbox("按来源筛选", source_options, key="selected_report_source")
-    active_source = None if selected_source == "全部" else selected_source
-    reports = capability_service.list_reports(source_name=active_source, limit=20)
+    filter_cols = st.columns([1, 1, 1])
+    with filter_cols[0]:
+        category_options = build_source_category_options(source_rows)
+        if st.session_state.selected_report_category not in category_options:
+            st.session_state.selected_report_category = category_options[0]
+        selected_category = st.selectbox("按分类筛选", category_options, key="selected_report_category")
+    with filter_cols[1]:
+        source_options = build_source_name_options(source_rows, selected_category)
+        if st.session_state.selected_report_source not in source_options:
+            st.session_state.selected_report_source = source_options[0]
+        selected_source = st.selectbox("按来源筛选", source_options, key="selected_report_source")
+    with filter_cols[2]:
+        report_limit = st.slider("展示数量", min_value=4, max_value=24, value=12, step=2)
+    active_source = None if selected_source == "全部来源" else selected_source
+    active_category = None if selected_category == "全部分类" else selected_category
+    reports = capability_service.list_reports(source_name=active_source, limit=report_limit, source_category=active_category)
 
     st.markdown("### 最近报告")
     if reports:
         summary_export_cols = st.columns(2)
         with summary_export_cols[0]:
             if st.button("导出当前报告摘要 Markdown", use_container_width=True):
-                exported = capability_service.export_report_summary(active_source, 20, ["md"])
-                _append_runtime_log(f"[report] 已导出报告摘要 Markdown：{active_source or '全部来源'}")
+                exported = capability_service.export_report_summary(active_source, report_limit, ["md"], source_category=active_category)
+                _append_runtime_log(f"[report] 已导出报告摘要 Markdown：{active_source or active_category or '全部来源'}")
                 st.success("报告摘要 Markdown 导出完成")
                 st.json(exported)
         with summary_export_cols[1]:
             if st.button("导出当前报告摘要 PDF", use_container_width=True):
-                exported = capability_service.export_report_summary(active_source, 20, ["pdf"])
-                _append_runtime_log(f"[report] 已导出报告摘要 PDF：{active_source or '全部来源'}")
+                exported = capability_service.export_report_summary(active_source, report_limit, ["pdf"], source_category=active_category)
+                _append_runtime_log(f"[report] 已导出报告摘要 PDF：{active_source or active_category or '全部来源'}")
                 st.success("报告摘要 PDF 导出完成")
                 st.json(exported)
-        st.dataframe(reports, use_container_width=True)
-        report_map = {
-            f"{item['source_name']} / {item['title']}": str(item["report_id"])
-            for item in reports
-        }
-        selected_label = st.selectbox("选择一条报告查看详情", list(report_map.keys()))
-        selected_report_id = report_map[selected_label]
-        detail = capability_service.get_report_detail(selected_report_id)
-        if detail is not None:
-            st.markdown("### 详细解读")
-            st.write(f"来源：{detail['source_name']}")
-            st.write(f"发布时间：{detail.get('published_at') or '未知'}")
-            st.write(f"事实摘要：{detail.get('factual_summary') or detail.get('summary_text') or '暂无'}")
-            st.write(f"解读分析：{detail.get('interpreted_summary') or '暂无'}")
-            if detail.get("body_text"):
-                with st.expander("正文摘录", expanded=False):
-                    st.write(detail["body_text"])
+        for row_index, report_row in enumerate(chunk_reports(reports, columns=2)):
+            columns = st.columns(2)
+            for col_index, report in enumerate(report_row):
+                with columns[col_index]:
+                    with st.container(border=True):
+                        st.markdown(f"#### {report['title']}")
+                        st.caption(
+                            f"{report['source_name']} | {report.get('source_category') or '未分类'} | "
+                            f"{report.get('published_at') or '未知时间'}"
+                        )
+                        st.write(report.get("overview_summary") or "暂无概览摘要")
+                        status_text = "已生成详细解读" if report.get("deep_reading_ready") else "未生成详细解读"
+                        if report.get("is_partial"):
+                            status_text += " | 正文抓取不完整"
+                        st.caption(status_text)
 
-            export_cols = st.columns(2)
-            with export_cols[0]:
-                if st.button("导出该报告 Markdown", use_container_width=True):
-                    exported = capability_service.export_report(selected_report_id, ["md"])
-                    _append_runtime_log(f"[report] 已导出 Markdown：{selected_report_id}")
-                    st.success("Markdown 导出完成")
-                    st.json(exported)
-            with export_cols[1]:
-                if st.button("导出该报告 PDF", use_container_width=True):
-                    exported = capability_service.export_report(selected_report_id, ["pdf"])
-                    _append_runtime_log(f"[report] 已导出 PDF：{selected_report_id}")
-                    st.success("PDF 导出完成")
-                    st.json(exported)
+                        action_cols = st.columns(3)
+                        report_id = str(report["report_id"])
+                        with action_cols[0]:
+                            if st.button("查看详细区", key=f"report-open-{row_index}-{col_index}", use_container_width=True):
+                                _append_runtime_log(f"[report] 打开详细页：{report_id}")
+                                _open_report_detail_page(report_id, auto_generate=False)
+                        with action_cols[1]:
+                            if st.button("生成详细解读", key=f"report-deep-{row_index}-{col_index}", use_container_width=True):
+                                _append_runtime_log(f"[report] 打开详细页并准备生成解读：{report_id}")
+                                _open_report_detail_page(report_id, auto_generate=True)
+                        with action_cols[2]:
+                            st.link_button("原文链接", str(report["url"]), use_container_width=True)
+
+                        with st.expander("查看概览详情", expanded=False):
+                            st.write(f"事实摘要：{report.get('factual_summary') or '暂无'}")
+                            st.write(f"解读概览：{report.get('interpreted_summary') or '暂无'}")
+
+        st.info("点击卡片里的“查看详细区”或“生成详细解读”，会打开独立阅读页。")
     else:
         st.info("当前筛选条件下还没有可查看的报告。")
 
-    with st.expander("最近报告解读", expanded=True):
-        analyses = [
-            item
-            for item in storage.load_collection("analysis_results")
-            if item.get("analysis_kind") == "report_interpretation"
-        ]
-        if analyses:
-            for item in analyses[-10:][::-1]:
+    with st.expander("最近已生成的详细解读", expanded=False):
+        readings = storage.load_collection("deep_report_readings")
+        if readings:
+            readings.sort(key=lambda item: item.get("generated_at", ""), reverse=True)
+            for item in readings[:10]:
                 st.markdown(f"#### {item['title']}")
-                st.write(f"事实摘要：{item.get('factual_summary', '')}")
-                st.write(f"解读分析：{item.get('interpreted_summary', '')}")
+                st.caption(f"生成时间：{item.get('generated_at') or '未知'}")
+                st.write(item.get("summary") or "暂无摘要")
                 st.divider()
         else:
-            st.info("当前还没有报告解读。")
+            st.info("当前还没有已生成的详细解读。")
+
+    with st.expander("最近抓取问题", expanded=False):
+        issues = [item for item in storage.load_collection("report_skips") if item.get("reason") not in {"duplicate"}]
+        if issues:
+            for item in issues[-20:][::-1]:
+                source = item.get("source") or "未知来源"
+                reason = item.get("reason") or "未知原因"
+                title = item.get("title")
+                line = f"[{source}] {reason}"
+                if title:
+                    line += f" | {title}"
+                st.write(line)
+        else:
+            st.info("当前没有抓取问题记录。")
 
 
 def _render_digest_tab(capability_service) -> None:
@@ -445,6 +616,10 @@ def main() -> None:
     agent = AssistantAgent(storage=storage, service_registry=service_registry)
 
     _render_sidebar(storage)
+
+    if str(st.query_params.get("page", "")).strip() == "report-detail":
+        _render_report_detail_page(capability_service)
+        return
 
     st.title("NextInAI 前端控制台")
     st.caption("围绕 AI 情报追踪、对话分析、简报生成和主动交付的一体化本地前端。")

@@ -13,6 +13,8 @@ DEFAULT_COLLECTIONS = {
     "checkpoints": [],
     "content_items": [],
     "analysis_results": [],
+    "deep_report_readings": [],
+    "report_excerpt_translations": [],
     "report_skips": [],
     "events": [],
     "session_states": [],

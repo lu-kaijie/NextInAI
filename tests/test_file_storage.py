@@ -16,8 +16,12 @@ def test_workspace_initialization_creates_default_json_files(tmp_path: Path) -> 
 
     subscriptions_file = settings.data_dir / "subscriptions.json"
     events_file = settings.data_dir / "events.json"
+    deep_readings_file = settings.data_dir / "deep_report_readings.json"
+    excerpt_translations_file = settings.data_dir / "report_excerpt_translations.json"
     assert subscriptions_file.exists()
     assert events_file.exists()
+    assert deep_readings_file.exists()
+    assert excerpt_translations_file.exists()
     assert json.loads(subscriptions_file.read_text(encoding="utf-8")) == []
 
 

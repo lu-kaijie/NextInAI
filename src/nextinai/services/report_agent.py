@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 from typing import Any
 
 from nextinai.agents import IntelligenceAgent, OpenAIIntelligenceAgent, RuleBasedIntelligenceAgent
 from nextinai.collectors.reports import DEFAULT_REPORT_SOURCES, CollectedReportItem, ReportSource, ReportSourceCollector
 from nextinai.core.config import get_settings
-from nextinai.digests.exporters import DigestExporter
 from nextinai.core.logging import build_progress_callback, get_logger, log_error, log_event
+from nextinai.digests.exporters import DigestExporter
 from nextinai.domain.enums import AnalysisKind, EventSignal, SourceKind
 from nextinai.services.contracts import ReportService
 from nextinai.storage.files import FileStorage, ensure_workspace
@@ -50,7 +51,7 @@ class AgenticReportService(ReportService):
             self.agent = RuleBasedIntelligenceAgent()
 
     def fetch_reports(self, source_group: str, progress_callback=None) -> str:
-        selected_sources = [source for source in self.sources if source.group == source_group]
+        selected_sources = self._select_sources_for_fetch(source_group)
         if not selected_sources:
             raise ValueError(f"未找到来源组：{source_group}")
         progress = build_progress_callback(self.logger, progress_callback)
@@ -77,6 +78,12 @@ class AgenticReportService(ReportService):
                 progress(f"来源抓取失败：{source.name}，原因：{exc}")
                 continue
 
+            report_skips = [
+                item
+                for item in report_skips
+                if not (item.get("source") == source.name and not item.get("title"))
+            ]
+
             progress(f"来源抓取完成：{source.name}，获得 {len(items)} 篇候选文章")
             for item in items:
                 fingerprint = self._build_fingerprint(item)
@@ -100,7 +107,7 @@ class AgenticReportService(ReportService):
                     titles.append(item.title)
 
                 if source_ref in analysis_index:
-                    progress(f"[{source.name}] 已有解读，跳过：{item.title}")
+                    progress(f"[{source.name}] 已有概览解读，跳过：{item.title}")
                     continue
                 progress(f"[{source.name}] 正在解读：{item.title}")
                 interpretation = self.agent.interpret_report(
@@ -131,7 +138,7 @@ class AgenticReportService(ReportService):
 
         titles_preview = "；".join(titles[:5]) if titles else "无新报告"
         summary = (
-            f"报告采集完成：新增 {created} 条，解读 {interpreted} 条，跳过 {skipped} 条。"
+            f"报告采集完成：新增 {created} 条，概览解读 {interpreted} 条，跳过 {skipped} 条。"
             f"本轮重点：{titles_preview}"
         )
         log_event(
@@ -144,96 +151,230 @@ class AgenticReportService(ReportService):
         )
         return summary
 
-    def list_sources(self, source_group: str | None = None) -> list[dict[str, str | int | None]]:
+    def list_sources(
+        self,
+        source_group: str | None = None,
+        source_category: str | None = None,
+    ) -> list[dict[str, str | int | bool | None]]:
         content_items = self.storage.load_collection("content_items")
-        rows: list[dict[str, str | int | None]] = []
+        report_skips = self.storage.load_collection("report_skips")
+        rows: list[dict[str, str | int | bool | None]] = []
         for source in self.sources:
-            if source_group is not None and source.group != source_group:
+            if source_group is not None and source.group != source_group and source_group != "default":
+                continue
+            if source_category is not None and source.category != source_category:
                 continue
             matched = [
                 item
                 for item in content_items
                 if item.get("source_kind") == SourceKind.AI_REPORT.value and item.get("source_key") == source.name
             ]
+            issues = [
+                item
+                for item in report_skips
+                if item.get("source") == source.name and item.get("reason") not in {"duplicate"}
+            ]
             latest = max((item.get("published_at") or "" for item in matched), default=None)
             rows.append(
                 {
                     "source_name": source.name,
                     "group": source.group,
+                    "category": source.category,
                     "kind": source.kind,
                     "url": source.url,
+                    "description": source.description,
+                    "default_enabled": source.default_enabled,
                     "report_count": len(matched),
                     "latest_published_at": latest,
+                    "issue_count": len(issues),
+                    "last_issue": issues[-1].get("reason") if issues else None,
                 }
             )
+        rows.sort(key=lambda item: (str(item.get("category") or ""), str(item.get("source_name") or "")))
         return rows
 
-    def list_reports(self, source_name: str | None = None, limit: int = 10) -> list[dict[str, str | bool | None]]:
+    def list_reports(
+        self,
+        source_name: str | None = None,
+        limit: int = 10,
+        source_category: str | None = None,
+    ) -> list[dict[str, str | bool | None]]:
         analysis_index = {
             row.get("source_ref"): row
             for row in self.storage.load_collection("analysis_results")
             if row.get("analysis_kind") == AnalysisKind.REPORT_INTERPRETATION.value
         }
-        rows = [
-            item
-            for item in self.storage.load_collection("content_items")
-            if item.get("source_kind") == SourceKind.AI_REPORT.value
-            and (source_name is None or item.get("source_key") == source_name)
-        ]
+        deep_reading_index = {
+            row.get("source_ref"): row
+            for row in self.storage.load_collection("deep_report_readings")
+        }
+        rows = []
+        for item in self.storage.load_collection("content_items"):
+            if item.get("source_kind") != SourceKind.AI_REPORT.value:
+                continue
+            if source_name is not None and item.get("source_key") != source_name:
+                continue
+            category = self._resolve_source_category(item)
+            if source_category is not None and category != source_category:
+                continue
+            rows.append(item)
         rows.sort(key=lambda item: (item.get("published_at") or "", item.get("title") or ""), reverse=True)
+
         reports: list[dict[str, str | bool | None]] = []
         for item in rows[:limit]:
             report_id = f"report:{item['dedupe_fingerprint']}"
-            analysis = analysis_index.get(report_id)
+            analysis = analysis_index.get(report_id) or {}
+            deep_reading = deep_reading_index.get(report_id) or {}
+            summary = (
+                analysis.get("interpreted_summary")
+                or analysis.get("factual_summary")
+                or item.get("summary_text")
+                or "暂无概览摘要"
+            )
             reports.append(
                 {
                     "report_id": report_id,
                     "source_name": item.get("source_key"),
+                    "source_category": category,
                     "title": item.get("title"),
                     "url": item.get("url"),
                     "published_at": item.get("published_at"),
-                    "summary": (analysis or {}).get("factual_summary") or item.get("summary_text"),
-                    "has_analysis": analysis is not None,
+                    "overview_summary": summary,
+                    "factual_summary": analysis.get("factual_summary"),
+                    "interpreted_summary": analysis.get("interpreted_summary"),
+                    "summary": summary,
+                    "has_analysis": bool(analysis),
                     "is_partial": bool(item.get("partial")),
+                    "deep_reading_ready": bool(deep_reading),
+                    "deep_reading_generated_at": deep_reading.get("generated_at"),
                 }
             )
         return reports
 
     def get_report_detail(self, report_id: str) -> dict[str, str | bool | None] | None:
-        fingerprint = report_id.removeprefix("report:")
-        content = next(
-            (
-                item
-                for item in self.storage.load_collection("content_items")
-                if item.get("source_kind") == SourceKind.AI_REPORT.value
-                and item.get("dedupe_fingerprint") == fingerprint
-            ),
-            None,
-        )
+        content = self._find_content_by_report_id(report_id)
         if content is None:
             return None
-        analysis = next(
-            (
-                item
-                for item in self.storage.load_collection("analysis_results")
-                if item.get("analysis_kind") == AnalysisKind.REPORT_INTERPRETATION.value
-                and item.get("source_ref") == report_id
-            ),
-            None,
+        analysis = self._find_overview_analysis(report_id) or {}
+        deep_reading = self._find_deep_reading(report_id) or {}
+        excerpt_translation = self._find_excerpt_translation(report_id) or {}
+        metadata = content.get("metadata_json") or {}
+        resolved_category = self._resolve_source_category(content)
+        overview_summary = (
+            analysis.get("interpreted_summary")
+            or analysis.get("factual_summary")
+            or content.get("summary_text")
+            or "暂无概览摘要"
         )
         return {
             "report_id": report_id,
             "source_name": str(content.get("source_key") or ""),
+            "source_category": resolved_category,
             "title": str(content.get("title") or ""),
             "url": str(content.get("url") or ""),
             "published_at": content.get("published_at"),
             "summary_text": content.get("summary_text"),
             "body_text": content.get("body_text"),
-            "factual_summary": (analysis or {}).get("factual_summary"),
-            "interpreted_summary": (analysis or {}).get("interpreted_summary"),
-            "has_analysis": analysis is not None,
+            "overview_summary": overview_summary,
+            "factual_summary": analysis.get("factual_summary"),
+            "interpreted_summary": analysis.get("interpreted_summary"),
+            "has_analysis": bool(analysis),
             "is_partial": bool(content.get("partial")),
+            "deep_reading_ready": bool(deep_reading),
+            "deep_reading_markdown": deep_reading.get("markdown_body"),
+            "deep_reading_summary": deep_reading.get("summary"),
+            "deep_reading_generated_at": deep_reading.get("generated_at"),
+            "localized_excerpt_text": excerpt_translation.get("translated_text"),
+            "localized_excerpt_generated_at": excerpt_translation.get("generated_at"),
         }
+
+    def generate_deep_report_reading(self, report_id: str, force: bool = False) -> dict[str, str | bool | None]:
+        detail = self.get_report_detail(report_id)
+        if detail is None:
+            raise ValueError("未找到可深读的报告。")
+        if detail.get("deep_reading_ready") and not force:
+            return detail
+
+        deep_report_readings = self.storage.load_collection("deep_report_readings")
+        content = self._find_content_by_report_id(report_id)
+        if content is None:
+            raise ValueError("未找到可深读的报告正文。")
+        deep_reading = self.agent.deep_read_report(
+            title=str(content.get("title") or ""),
+            source_name=str(content.get("source_key") or ""),
+            url=str(content.get("url") or ""),
+            summary_text=content.get("summary_text"),
+            body_text=content.get("body_text"),
+        )
+        record = {
+            "analysis_kind": AnalysisKind.REPORT_DEEP_READING.value,
+            "source_ref": report_id,
+            "title": content.get("title"),
+            "summary": deep_reading.summary,
+            "markdown_body": deep_reading.markdown_body,
+            "evidence_json": deep_reading.evidence,
+            "is_partial": deep_reading.is_partial,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "content_hash": self._build_deep_reading_hash(content),
+        }
+        replaced = False
+        for index, item in enumerate(deep_report_readings):
+            if item.get("source_ref") == report_id:
+                deep_report_readings[index] = record
+                replaced = True
+                break
+        if not replaced:
+            deep_report_readings.append(record)
+        self.storage.save_collection("deep_report_readings", deep_report_readings)
+        log_event(self.logger, "报告深度带读已生成", report_id=report_id, force=force)
+        refreshed = self.get_report_detail(report_id)
+        if refreshed is None:
+            raise ValueError("深度带读生成后未能重新读取报告详情。")
+        return refreshed
+
+    def generate_report_excerpt_translation(
+        self,
+        report_id: str,
+        force: bool = False,
+    ) -> dict[str, str | bool | None]:
+        detail = self.get_report_detail(report_id)
+        if detail is None:
+            raise ValueError("未找到报告详情。")
+        body_text = str(detail.get("body_text") or "").strip()
+        if not body_text:
+            return detail
+        if detail.get("localized_excerpt_text") and not force:
+            return detail
+
+        content = self._find_content_by_report_id(report_id)
+        if content is None:
+            raise ValueError("未找到报告正文。")
+        translated_text = self.agent.translate_report_excerpt(
+            title=str(content.get("title") or ""),
+            source_name=str(content.get("source_key") or ""),
+            excerpt_text=body_text,
+        )
+        records = self.storage.load_collection("report_excerpt_translations")
+        record = {
+            "source_ref": report_id,
+            "title": content.get("title"),
+            "translated_text": translated_text,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "content_hash": self._build_excerpt_hash(content),
+        }
+        replaced = False
+        for index, item in enumerate(records):
+            if item.get("source_ref") == report_id:
+                records[index] = record
+                replaced = True
+                break
+        if not replaced:
+            records.append(record)
+        self.storage.save_collection("report_excerpt_translations", records)
+        refreshed = self.get_report_detail(report_id)
+        if refreshed is None:
+            raise ValueError("正文摘录译文生成后未能重新读取详情。")
+        return refreshed
 
     def export_report(self, report_id: str, formats: list[str]) -> dict[str, str]:
         detail = self.get_report_detail(report_id)
@@ -255,10 +396,11 @@ class AgenticReportService(ReportService):
         source_name: str | None,
         limit: int,
         formats: list[str],
+        source_category: str | None = None,
     ) -> dict[str, str]:
-        reports = self.list_reports(source_name=source_name, limit=limit)
-        title = f"{source_name or 'all-sources'}-report-summary"
-        markdown = self._render_report_summary_markdown(source_name, reports)
+        reports = self.list_reports(source_name=source_name, limit=limit, source_category=source_category)
+        title = self._build_summary_title(source_name, source_category)
+        markdown = self._render_report_summary_markdown(title, reports)
         slug = self._build_export_slug({"title": title})
         exported: dict[str, str] = {}
         if "md" in formats:
@@ -268,6 +410,67 @@ class AgenticReportService(ReportService):
             path = self.exporter.export_pdf(markdown, self.report_output_dir / f"{slug}.pdf")
             exported["pdf"] = str(path)
         return exported
+
+    def _select_sources_for_fetch(self, source_group: str) -> list[ReportSource]:
+        if source_group == "default":
+            defaults = [source for source in self.sources if source.default_enabled]
+            if defaults:
+                return defaults
+        return [source for source in self.sources if source.group == source_group or source.category == source_group]
+
+    def _find_content_by_report_id(self, report_id: str) -> dict[str, Any] | None:
+        fingerprint = report_id.removeprefix("report:")
+        return next(
+            (
+                item
+                for item in self.storage.load_collection("content_items")
+                if item.get("source_kind") == SourceKind.AI_REPORT.value
+                and item.get("dedupe_fingerprint") == fingerprint
+            ),
+            None,
+        )
+
+    def _find_overview_analysis(self, report_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                item
+                for item in self.storage.load_collection("analysis_results")
+                if item.get("analysis_kind") == AnalysisKind.REPORT_INTERPRETATION.value
+                and item.get("source_ref") == report_id
+            ),
+            None,
+        )
+
+    def _find_deep_reading(self, report_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                item
+                for item in self.storage.load_collection("deep_report_readings")
+                if item.get("source_ref") == report_id
+            ),
+            None,
+        )
+
+    def _find_excerpt_translation(self, report_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                item
+                for item in self.storage.load_collection("report_excerpt_translations")
+                if item.get("source_ref") == report_id
+            ),
+            None,
+        )
+
+    def _resolve_source_category(self, content: dict[str, Any]) -> str:
+        metadata = content.get("metadata_json") or {}
+        category = metadata.get("category")
+        if category:
+            return str(category)
+        source_name = str(content.get("source_key") or "")
+        for source in self.sources:
+            if source.name == source_name:
+                return source.category
+        return ""
 
     @staticmethod
     def _build_fingerprint(item: CollectedReportItem) -> str:
@@ -291,7 +494,28 @@ class AgenticReportService(ReportService):
         }
 
     @staticmethod
+    def _build_deep_reading_hash(content: dict[str, Any]) -> str:
+        raw = f"{content.get('title')}|{content.get('url')}|{content.get('summary_text')}|{content.get('body_text')}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _build_excerpt_hash(content: dict[str, Any]) -> str:
+        raw = f"{content.get('title')}|{content.get('url')}|{content.get('body_text')}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _render_report_markdown(detail: dict[str, str | bool | None]) -> str:
+        if detail.get("deep_reading_markdown"):
+            lines = [
+                str(detail["deep_reading_markdown"]).strip(),
+                "",
+                "## 报告元信息",
+                f"- 来源: {detail['source_name']}",
+                f"- 分类: {detail.get('source_category') or '未分类'}",
+                f"- 发布时间: {detail.get('published_at') or '未知'}",
+                f"- 链接: {detail['url']}",
+            ]
+            return "\n".join(lines).strip()
         lines = [
             f"# {detail['title']}",
             "",
@@ -318,22 +542,31 @@ class AgenticReportService(ReportService):
         return f"report-{normalized}"
 
     @staticmethod
+    def _build_summary_title(source_name: str | None, source_category: str | None) -> str:
+        if source_name:
+            return f"{source_name} 报告速览"
+        if source_category:
+            return f"{source_category} 报告速览"
+        return "全部来源 报告速览"
+
+    @staticmethod
     def _render_report_summary_markdown(
-        source_name: str | None,
+        title: str,
         reports: list[dict[str, str | bool | None]],
     ) -> str:
-        title = f"{source_name or '全部来源'} 报告摘要"
         lines = [f"# {title}", ""]
         if not reports:
-            lines.append("当前没有可导出的报告摘要。")
+            lines.append("当前没有可导出的报告概览。")
             return "\n".join(lines)
         for index, report in enumerate(reports, start=1):
             lines.extend(
                 [
                     f"## {index}. {report['title']}",
                     f"- 来源: {report['source_name']}",
+                    f"- 分类: {report.get('source_category') or '未分类'}",
                     f"- 发布时间: {report.get('published_at') or '未知'}",
-                    f"- 事实摘要: {report.get('summary') or '暂无'}",
+                    f"- 快速概览: {report.get('overview_summary') or report.get('summary') or '暂无'}",
+                    f"- 已生成详细解读: {'是' if report.get('deep_reading_ready') else '否'}",
                     f"- 链接: {report.get('url') or '无'}",
                     "",
                 ]

@@ -21,6 +21,14 @@ class ReportInterpretation:
 
 
 @dataclass(slots=True)
+class DeepReportReading:
+    markdown_body: str
+    summary: str
+    evidence: list[str]
+    is_partial: bool
+
+
+@dataclass(slots=True)
 class TrendingProjectAnalysis:
     purpose: str
     why_trending: str
@@ -54,6 +62,20 @@ class IntelligenceAgent:
         summary_text: str | None,
         body_text: str | None,
     ) -> ReportInterpretation:
+        raise NotImplementedError
+
+    def deep_read_report(
+        self,
+        *,
+        title: str,
+        source_name: str,
+        url: str,
+        summary_text: str | None,
+        body_text: str | None,
+    ) -> DeepReportReading:
+        raise NotImplementedError
+
+    def translate_report_excerpt(self, *, title: str, source_name: str, excerpt_text: str) -> str:
         raise NotImplementedError
 
     def compose_digest_overview(
@@ -130,6 +152,71 @@ class RuleBasedIntelligenceAgent(IntelligenceAgent):
             interpreted_summary=interpretation,
             evidence=evidence,
             is_partial=partial,
+        )
+
+    def deep_read_report(
+        self,
+        *,
+        title: str,
+        source_name: str,
+        url: str,
+        summary_text: str | None,
+        body_text: str | None,
+    ) -> DeepReportReading:
+        content = (body_text or summary_text or "").strip()
+        partial = not bool(body_text and body_text.strip())
+        sections = self._segment_report_content(content)[:3] or [summary_text or "当前可读正文非常有限。"]
+        summary = self._build_deep_report_summary(title, source_name, content, partial)
+        lines = [
+            f"# {title} 深度带读",
+            "",
+            "## 先说结论",
+            summary,
+            "",
+            "## 这篇内容想解决什么问题",
+            f"{source_name} 这篇内容想让外部更快理解《{title}》背后的重点。"
+            "对使用者来说，真正要抓的是它改变了什么边界、释放了什么信号、以及哪些地方还只是方向描述。",
+            "",
+            "## 核心观点拆解",
+            self._build_reader_takeaways(title, content, partial),
+            "",
+            "## 逐段带读",
+        ]
+        for index, section in enumerate(sections, start=1):
+            lines.extend(
+                [
+                    f"### 第 {index} 段",
+                    f"原文要点：{section}",
+                    f"带读说明：{self._build_section_commentary(title, section, index)}",
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+                "## 值得关注的技术 / 产品 / 商业信号",
+                self._build_signal_commentary(title, content, partial),
+                "",
+                "## 我会保留判断的地方",
+                "如果正文抓取不完整，或者原文大量使用宣传式表达而缺少可验证细节，就不能把文中说法直接等同为能力已经成熟落地。"
+                "更稳妥的做法，是把这篇内容当成一手线索，再去追 API、代码、价格、评测或用户反馈。",
+                "",
+                "## 对实际使用者的启发",
+                self._build_reader_takeaways(title, content, partial),
+            ]
+        )
+        return DeepReportReading(
+            markdown_body="\n".join(lines).strip(),
+            summary=summary,
+            evidence=[url, title],
+            is_partial=partial,
+        )
+
+    def translate_report_excerpt(self, *, title: str, source_name: str, excerpt_text: str) -> str:
+        if self._looks_like_chinese(excerpt_text):
+            return excerpt_text.strip()
+        return (
+            f"以下是《{title}》正文摘录的中文译文（规则降级版，建议在已配置模型时查看更自然的译文）：\n\n"
+            f"{excerpt_text.strip()}"
         )
 
     def compose_digest_overview(
@@ -325,6 +412,89 @@ class RuleBasedIntelligenceAgent(IntelligenceAgent):
         partial_suffix = "由于正文不完整，这部分判断需要后续复核。" if partial else ""
         return f"从 NextInAI agent 的角度看，这条更新 {source_name} { '；'.join(themes) }。{partial_suffix}".strip()
 
+    @staticmethod
+    def _segment_report_content(content: str) -> list[str]:
+        if not content:
+            return []
+        parts = [part.strip() for part in re.split(r"(?<=[。！？.!?])\s+", content) if part.strip()]
+        compact: list[str] = []
+        current = ""
+        for part in parts:
+            if len(current) + len(part) <= 180:
+                current = f"{current} {part}".strip()
+            else:
+                if current:
+                    compact.append(current)
+                current = part
+        if current:
+            compact.append(current)
+        return compact[:5]
+
+    @staticmethod
+    def _build_deep_report_summary(title: str, source_name: str, content: str, partial: bool) -> str:
+        lowered = f"{title}\n{content}".lower()
+        points: list[str] = [f"这篇《{title}》最值得看的，不是表面消息本身，而是 {source_name} 想把什么方向推到台前。"]
+        if any(keyword in lowered for keyword in ["agent", "workflow", "automation", "tool"]):
+            points.append("它释放的是 agent 或工作流能力继续成型的信号。")
+        if any(keyword in lowered for keyword in ["model", "gpt", "llm", "inference"]):
+            points.append("它也会影响你对模型能力和落地方式的判断。")
+        if any(keyword in lowered for keyword in ["policy", "safety", "security", "risk"]):
+            points.append("同时还带有安全或治理层面的背景。")
+        if partial:
+            points.append("但当前正文抓取不完整，所以部分判断只能先保守处理。")
+        return "".join(points)
+
+    @staticmethod
+    def _build_section_commentary(title: str, section: str, index: int) -> str:
+        lowered = f"{title}\n{section}".lower()
+        if any(keyword in lowered for keyword in ["announce", "introduce", "launch", "release", "introducing"]):
+            return "这一段通常在回答“他们这次到底推出了什么”，阅读时要把品牌表述和真正可用的交付边界分开。"
+        if any(keyword in lowered for keyword in ["benchmark", "eval", "performance", "latency", "speed"]):
+            return "这里更像是在证明效果，但要特别留意有没有只挑对自己有利的指标，以及是否缺少真实使用条件。"
+        if any(keyword in lowered for keyword in ["policy", "safety", "security", "risk"]):
+            return "这一段重点不只是表态，而是反映团队当前最在意的风险面在哪里。"
+        return f"第 {index} 段更像是在为核心主张铺垫背景。读这一段的关键，是判断它在整篇叙事里承担什么作用，而不是只记住表面措辞。"
+
+    @staticmethod
+    def _build_signal_commentary(title: str, content: str, partial: bool) -> str:
+        lowered = f"{title}\n{content}".lower()
+        signals: list[str] = []
+        if any(keyword in lowered for keyword in ["api", "sdk", "platform", "tool"]):
+            signals.append("它可能意味着接入层或平台层在扩展，后续值得继续看 API、SDK 或控制台是否同步更新。")
+        if any(keyword in lowered for keyword in ["enterprise", "business", "customer", "production"]):
+            signals.append("它也可能在释放商业化或生产落地信号，不只是研究展示。")
+        if any(keyword in lowered for keyword in ["benchmark", "eval", "latency", "performance"]):
+            signals.append("如果文中重点强调评测或性能，这往往意味着团队正在争夺“真实可用性”而不是单纯模型叙事。")
+        if not signals:
+            signals.append("更稳妥的判断是：它提供了一条值得跟踪的一手线索，但是否重要还要看后续产品、代码或社区反馈能否跟上。")
+        if partial:
+            signals.append("由于正文不完整，这些信号强度只能先按中低置信度看待。")
+        return " ".join(signals)
+
+    @staticmethod
+    def _build_reader_takeaways(title: str, content: str, partial: bool) -> str:
+        lowered = f"{title}\n{content}".lower()
+        takeaways: list[str] = []
+        if any(keyword in lowered for keyword in ["agent", "workflow", "automation"]):
+            takeaways.append("如果你在做 agent，重点要看它改变的是能力上限、工作流组织方式，还是单纯把旧能力包装得更易用。")
+        if any(keyword in lowered for keyword in ["model", "llm", "inference", "benchmark"]):
+            takeaways.append("如果你关心模型选型，这篇内容更适合和独立评测、社区试用结果一起交叉验证。")
+        if any(keyword in lowered for keyword in ["api", "sdk", "platform", "tool"]):
+            takeaways.append("如果你偏工程落地，先盯住有没有 API、SDK、文档或价格层面的对应动作。")
+        if not takeaways:
+            takeaways.append("对大多数使用者来说，更实际的做法是先把它当成方向信号，再决定要不要继续追代码、产品页或用户案例。")
+        if partial:
+            takeaways.append("由于当前正文抓取不完整，不建议仅凭这份带读直接做采购或架构决策。")
+        return " ".join(takeaways)
+
+    @staticmethod
+    def _looks_like_chinese(text: str) -> bool:
+        if not text:
+            return False
+        chinese_chars = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+        letters = sum(1 for char in text if char.isalpha())
+        return chinese_chars > 0 and chinese_chars >= max(letters // 3, 20)
+
 
 class OpenAIIntelligenceAgent(IntelligenceAgent):
     """LLM-backed unified analysis agent."""
@@ -425,6 +595,81 @@ class OpenAIIntelligenceAgent(IntelligenceAgent):
             is_partial=(parsed.get("is_partial", "").lower() == "true") if parsed.get("is_partial") else fallback.is_partial,
         )
 
+    def deep_read_report(
+        self,
+        *,
+        title: str,
+        source_name: str,
+        url: str,
+        summary_text: str | None,
+        body_text: str | None,
+    ) -> DeepReportReading:
+        content = (body_text or summary_text or "").strip()
+        if not self.model or not content:
+            return self.fallback.deep_read_report(
+                title=title,
+                source_name=source_name,
+                url=url,
+                summary_text=summary_text,
+                body_text=body_text,
+            )
+        prompt = (
+            "你是 NextInAI 的 AI 报告深度带读 agent。"
+            "请直接输出中文 Markdown，不要输出 JSON，不要写额外前言。"
+            "你的角色像老师或专家带读，不是普通摘要器。"
+            "必须包含："
+            "先说结论；这篇内容想解决什么问题；核心观点拆解；逐段带读（至少 3 段，每段都含“原文要点”和“带读说明”）；"
+            "值得关注的技术/产品/商业信号；我会保留判断的地方；对实际使用者的启发。"
+            "要求："
+            "必须有评论、解释、判断依据和保留意见；"
+            "篇幅明显长于摘要；"
+            "如果正文不完整，要明确说明限制。"
+            f"\n来源：{source_name}\n标题：{title}\n链接：{url}\n内容：\n{content[:10000]}"
+        )
+        markdown = self._complete(prompt)
+        if not markdown:
+            return self.fallback.deep_read_report(
+                title=title,
+                source_name=source_name,
+                url=url,
+                summary_text=summary_text,
+                body_text=body_text,
+            )
+        return DeepReportReading(
+            markdown_body=markdown.strip(),
+            summary=self._extract_deep_read_summary(markdown, title),
+            evidence=[url, title],
+            is_partial=not bool(body_text and body_text.strip()),
+        )
+
+    def translate_report_excerpt(self, *, title: str, source_name: str, excerpt_text: str) -> str:
+        if self.fallback._looks_like_chinese(excerpt_text):
+            return excerpt_text.strip()
+        if not self.model or not excerpt_text.strip():
+            return self.fallback.translate_report_excerpt(
+                title=title,
+                source_name=source_name,
+                excerpt_text=excerpt_text,
+            )
+        prompt = (
+            "你是 NextInAI 的正文摘录翻译 agent。"
+            "请把下面这段正文摘录翻译成自然、流畅、适合中文读者阅读的中文。"
+            "要求："
+            "1. 忠实原意，不增删核心信息；"
+            "2. 语言自然，不要机械直译；"
+            "3. 保留专有名词、产品名、模型名；"
+            "4. 直接输出译文，不要加说明、不要加括号注释。"
+            f"\n来源：{source_name}\n标题：{title}\n正文摘录：\n{excerpt_text[:8000]}"
+        )
+        translated = self._complete(prompt)
+        if not translated:
+            return self.fallback.translate_report_excerpt(
+                title=title,
+                source_name=source_name,
+                excerpt_text=excerpt_text,
+            )
+        return translated.strip()
+
     def compose_digest_overview(
         self,
         *,
@@ -515,3 +760,11 @@ class OpenAIIntelligenceAgent(IntelligenceAgent):
             key, value = line.split("=", maxsplit=1)
             result[key.strip()] = value.strip()
         return result
+
+    @staticmethod
+    def _extract_deep_read_summary(markdown: str, title: str) -> str:
+        for line in markdown.splitlines():
+            stripped = line.strip().lstrip("#").strip()
+            if stripped and stripped != title:
+                return stripped[:120]
+        return f"{title} 的深度带读已生成。"

@@ -129,14 +129,39 @@ class UnifiedCapabilityService(CapabilityService):
         log_event(self.logger, "抓取报告来源组", source_group=source_group)
         return self.report_service.fetch_reports(source_group, progress_callback=progress_callback)
 
-    def list_report_sources(self, source_group: str | None = None) -> list[dict[str, str | int | None]]:
-        return self.report_service.list_sources(source_group)
+    def list_report_sources(
+        self,
+        source_group: str | None = None,
+        source_category: str | None = None,
+    ) -> list[dict[str, str | int | bool | None]]:
+        return self.report_service.list_sources(source_group, source_category)
 
-    def list_reports(self, source_name: str | None = None, limit: int = 10) -> list[dict[str, str | bool | None]]:
-        return self.report_service.list_reports(source_name=source_name, limit=limit)
+    def list_reports(
+        self,
+        source_name: str | None = None,
+        limit: int = 10,
+        source_category: str | None = None,
+    ) -> list[dict[str, str | bool | None]]:
+        return self.report_service.list_reports(
+            source_name=source_name,
+            limit=limit,
+            source_category=source_category,
+        )
 
     def get_report_detail(self, report_id: str) -> dict[str, str | bool | None] | None:
         return self.report_service.get_report_detail(report_id)
+
+    def generate_deep_report_reading(self, report_id: str, force: bool = False) -> dict[str, str | bool | None]:
+        log_event(self.logger, "生成报告深度带读", report_id=report_id, force=force)
+        return self.report_service.generate_deep_report_reading(report_id, force=force)
+
+    def generate_report_excerpt_translation(
+        self,
+        report_id: str,
+        force: bool = False,
+    ) -> dict[str, str | bool | None]:
+        log_event(self.logger, "生成报告正文摘录译文", report_id=report_id, force=force)
+        return self.report_service.generate_report_excerpt_translation(report_id, force=force)
 
     def export_report(self, report_id: str, formats: list[str]) -> dict[str, str]:
         log_event(self.logger, "导出报告详情", report_id=report_id, formats=",".join(formats))
@@ -147,9 +172,22 @@ class UnifiedCapabilityService(CapabilityService):
         source_name: str | None,
         limit: int,
         formats: list[str],
+        source_category: str | None = None,
     ) -> dict[str, str]:
-        log_event(self.logger, "导出报告摘要", source_name=source_name, limit=limit, formats=",".join(formats))
-        return self.report_service.export_report_summary(source_name, limit, formats)
+        log_event(
+            self.logger,
+            "导出报告摘要",
+            source_name=source_name,
+            source_category=source_category,
+            limit=limit,
+            formats=",".join(formats),
+        )
+        return self.report_service.export_report_summary(
+            source_name,
+            limit,
+            formats,
+            source_category=source_category,
+        )
 
     def generate_digest(self, scope: str) -> str:
         log_event(self.logger, "生成简报", scope=scope)

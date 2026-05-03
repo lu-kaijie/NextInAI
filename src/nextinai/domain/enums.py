@@ -22,6 +22,7 @@ class AnalysisKind(str, Enum):
     REPOSITORY_SUMMARY = "repository_summary"
     TRENDING_SUMMARY = "trending_summary"
     REPORT_INTERPRETATION = "report_interpretation"
+    REPORT_DEEP_READING = "report_deep_reading"
     DIGEST = "digest"
 
 

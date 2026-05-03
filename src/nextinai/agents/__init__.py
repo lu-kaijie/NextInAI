@@ -1,6 +1,7 @@
 """Agent abstractions for NextInAI."""
 
 from nextinai.agents.intelligence import (
+    DeepReportReading,
     DigestOverview,
     IntelligenceAgent,
     OpenAIIntelligenceAgent,
@@ -10,6 +11,7 @@ from nextinai.agents.intelligence import (
 )
 
 __all__ = [
+    "DeepReportReading",
     "DigestOverview",
     "IntelligenceAgent",
     "OpenAIIntelligenceAgent",
