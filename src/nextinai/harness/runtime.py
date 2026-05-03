@@ -14,6 +14,7 @@ from nextinai.storage.files import FileStorage
 class Tool(Protocol):
     name: str
     description: str
+    intent: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
     requires_confirmation: bool

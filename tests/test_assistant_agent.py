@@ -1,44 +1,120 @@
+import json
+from dataclasses import dataclass
+from typing import Callable
+
 from nextinai.agents.assistant import AssistantAgent
 from nextinai.core.config import get_settings
 from nextinai.storage.files import FileStorage
 
 
-class FakePlanner:
-    def __init__(self, tool_name: str, tool_input: dict | None = None, intent: str = "query_intelligence") -> None:
-        self.tool_name = tool_name
-        self.tool_input = tool_input or {}
-        self.intent = intent
+@dataclass
+class _FakeFunction:
+    name: str
+    arguments: str
 
-    def decide(self, *, message: str, state) -> object:
-        from nextinai.agents.assistant import IntentDecision
 
-        return IntentDecision(
-            intent=self.intent,
-            tool_name=self.tool_name,
-            tool_input=dict(self.tool_input),
+@dataclass
+class _FakeToolCall:
+    id: str
+    function: _FakeFunction | None
+    type: str = "function"
+
+
+@dataclass
+class _FakeMessage:
+    tool_calls: list[_FakeToolCall] | None = None
+    content: str | None = None
+
+
+@dataclass
+class _FakeChoice:
+    message: _FakeMessage
+
+
+@dataclass
+class _FakeCompletion:
+    choices: list[_FakeChoice]
+
+
+def _has_tool_result(messages: list[dict]) -> bool:
+    return any(message.get("role") == "tool" for message in messages)
+
+
+ToolInputFactory = dict | Callable[[list[dict]], dict]
+
+
+def _last_tool_output(messages: list[dict]) -> dict:
+    for message in reversed(messages):
+        if message.get("role") == "tool":
+            return json.loads(message.get("content") or "{}")
+    return {}
+
+
+class ScriptedPlanner:
+    def __init__(self, turns: list[list[tuple[str, ToolInputFactory | None, str]]]) -> None:
+        self.turns = turns
+        self.turn_index = -1
+
+    def build_messages(self, *, message: str, state) -> list[dict]:
+        self.turn_index += 1
+        return [{"role": "user", "content": message}]
+
+    def create_completion(self, messages) -> _FakeCompletion:
+        current_turn = self.turns[min(self.turn_index, len(self.turns) - 1)]
+        executed_tools = sum(1 for message in messages if message.get("role") == "tool")
+        if executed_tools >= len(current_turn):
+            return _FakeCompletion(choices=[_FakeChoice(message=_FakeMessage(tool_calls=None, content=""))])
+        tool_name, raw_tool_input, intent = current_turn[executed_tools]
+        tool_input = raw_tool_input(messages) if callable(raw_tool_input) else dict(raw_tool_input or {})
+        return _FakeCompletion(
+            choices=[
+                _FakeChoice(
+                    message=_FakeMessage(
+                        tool_calls=[
+                            _FakeToolCall(
+                                id=f"fake-call-{self.turn_index + 1}-{executed_tools + 1}",
+                                function=_FakeFunction(
+                                    name=tool_name,
+                                    arguments=json.dumps(
+                                        {
+                                            **tool_input,
+                                            "__test_intent": intent,
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                ),
+                            )
+                        ]
+                    )
+                )
+            ]
         )
 
 
 class FailingPlanner:
-    def decide(self, *, message: str, state) -> object:
+    def build_messages(self, *, message: str, state) -> list[dict]:
+        return [{"role": "user", "content": message}]
+
+    def create_completion(self, messages) -> _FakeCompletion:
+        if _has_tool_result(messages):
+            return _FakeCompletion(choices=[_FakeChoice(message=_FakeMessage(tool_calls=None, content=""))])
         raise RuntimeError("planner unavailable")
 
 
 class SequencedPlanner:
-    def __init__(self, decisions: list[tuple[str, dict | None, str]]) -> None:
-        self.decisions = decisions
-        self.index = 0
+    def __init__(self, turns: list[list[tuple[str, ToolInputFactory | None, str]]]) -> None:
+        self.delegate = ScriptedPlanner(turns)
 
-    def decide(self, *, message: str, state) -> object:
-        from nextinai.agents.assistant import IntentDecision
+    def build_messages(self, *, message: str, state) -> list[dict]:
+        return self.delegate.build_messages(message=message, state=state)
 
-        tool_name, tool_input, intent = self.decisions[min(self.index, len(self.decisions) - 1)]
-        self.index += 1
-        return IntentDecision(
-            intent=intent,
-            tool_name=tool_name,
-            tool_input=dict(tool_input or {}),
-        )
+    def create_completion(self, messages) -> _FakeCompletion:
+        return self.delegate.create_completion(messages)
+
+
+class FakePlanner(SequencedPlanner):
+    def __init__(self, tool_name: str, tool_input: dict | None = None, intent: str = "query_intelligence") -> None:
+        super().__init__([[(tool_name, tool_input or {}, intent)]])
 
 
 def test_assistant_agent_queries_reports_and_supports_detail_followup(tmp_path) -> None:
@@ -80,8 +156,11 @@ def test_assistant_agent_queries_reports_and_supports_detail_followup(tmp_path) 
         storage=storage,
         intent_planner=SequencedPlanner(
             [
-                ("get_report_events", {"limit": 1}, "query_intelligence"),
-                ("get_event_detail", {"reference_index": 1}, "explore_detail"),
+                [("get_report_events", {"limit": 1}, "query_intelligence")],
+                [
+                    ("resolve_event_reference", {"reference_index": 1}, "resolve_reference"),
+                    ("get_event_detail", lambda messages: {"event_id": _last_tool_output(messages)["event_id"]}, "explore_detail"),
+                ],
             ]
         ),
     )
@@ -156,8 +235,11 @@ def test_assistant_agent_supports_chinese_ordinal_reference(tmp_path) -> None:
         storage=storage,
         intent_planner=SequencedPlanner(
             [
-                ("get_report_events", {"limit": 3}, "query_intelligence"),
-                ("get_event_detail", {"reference_index": 3}, "explore_detail"),
+                [("get_report_events", {"limit": 3}, "query_intelligence")],
+                [
+                    ("resolve_event_reference", {"reference_index": 3}, "resolve_reference"),
+                    ("get_event_detail", lambda messages: {"event_id": _last_tool_output(messages)["event_id"]}, "explore_detail"),
+                ],
             ]
         ),
     )
@@ -173,11 +255,11 @@ def test_assistant_agent_supports_chinese_ordinal_reference(tmp_path) -> None:
 
 def test_assistant_agent_returns_explicit_message_when_reference_resolution_fails(tmp_path) -> None:
     storage = FileStorage(tmp_path)
-    agent = AssistantAgent(storage=storage, intent_planner=FakePlanner("get_event_detail", {}))
+    agent = AssistantAgent(storage=storage, intent_planner=FakePlanner("resolve_event_reference", {"reference_index": 3}))
 
     response = agent.respond("第三个详细讲讲", session_id="session-missing-ref")
 
-    assert "没有成功定位到具体对象" in response.message
+    assert "没有定位到对应事件" in response.message
 
 
 def test_assistant_agent_returns_validation_error_for_unsupported_trending_window(tmp_path) -> None:
@@ -197,7 +279,7 @@ def test_assistant_agent_returns_validation_error_for_missing_required_export_fo
     storage = FileStorage(tmp_path)
     agent = AssistantAgent(
         storage=storage,
-        intent_planner=FakePlanner("export_trending", {"window": "daily"}),
+        intent_planner=FakePlanner("export_trending", {"window": "daily", "limit": 5}),
     )
 
     response = agent.respond("导出热门榜", session_id="session-missing-export-format")
@@ -210,7 +292,10 @@ def test_assistant_agent_requires_confirmation_for_side_effects(tmp_path) -> Non
     storage = FileStorage(tmp_path)
     agent = AssistantAgent(
         storage=storage,
-        intent_planner=FakePlanner("add_subscription", {"repository": "openai/openai-python"}),
+        intent_planner=FakePlanner(
+            "add_subscription",
+            {"repository": "openai/openai-python", "lookback_hours": 24, "refresh_minutes": 60},
+        ),
     )
     session_id = "session-2"
 
@@ -244,8 +329,15 @@ def test_assistant_agent_lists_and_deletes_tasks(tmp_path) -> None:
         storage=storage,
         intent_planner=SequencedPlanner(
             [
-                ("get_delivery_tasks", {}, "query_intelligence"),
-                ("delete_delivery_task", {"reference_index": 1}, "execute_action"),
+                [("get_delivery_tasks", {}, "query_intelligence")],
+                [
+                    ("resolve_delivery_task_reference", {"reference_index": 1}, "resolve_reference"),
+                    (
+                        "delete_delivery_task",
+                        lambda messages: {"task_id": _last_tool_output(messages)["task_id"]},
+                        "execute_action",
+                    ),
+                ],
             ]
         ),
     )
@@ -290,7 +382,22 @@ def test_assistant_agent_generates_briefing_from_last_events(tmp_path) -> None:
     )
     agent = AssistantAgent(
         storage=storage,
-        intent_planner=FakePlanner("render_briefing_preview", {"view": "flash"}, "generate_briefing"),
+        intent_planner=SequencedPlanner(
+            [
+                [
+                    ("prepare_briefing_context", {"scope": "daily", "view": "flash"}, "resolve_reference"),
+                    (
+                        "render_briefing_preview",
+                        lambda messages: {
+                            "scope": _last_tool_output(messages)["scope"],
+                            "view": _last_tool_output(messages)["view"],
+                            "events": _last_tool_output(messages)["events"],
+                        },
+                        "generate_briefing",
+                    ),
+                ]
+            ]
+        ),
     )
 
     response = agent.respond("生成简报", session_id="session-3")
@@ -330,7 +437,22 @@ def test_assistant_agent_generates_deep_briefing(tmp_path) -> None:
     )
     agent = AssistantAgent(
         storage=storage,
-        intent_planner=FakePlanner("render_briefing_preview", {"view": "deep"}, "generate_briefing"),
+        intent_planner=SequencedPlanner(
+            [
+                [
+                    ("prepare_briefing_context", {"scope": "daily", "view": "deep"}, "resolve_reference"),
+                    (
+                        "render_briefing_preview",
+                        lambda messages: {
+                            "scope": _last_tool_output(messages)["scope"],
+                            "view": _last_tool_output(messages)["view"],
+                            "events": _last_tool_output(messages)["events"],
+                        },
+                        "generate_briefing",
+                    ),
+                ]
+            ]
+        ),
     )
 
     response = agent.respond("生成深读简报", session_id="session-4")
@@ -446,6 +568,50 @@ def test_assistant_agent_reports_planner_failure(tmp_path) -> None:
     assert "planner 调度失败" in response.message
 
 
+def test_assistant_agent_stops_on_repeated_tool_call(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    agent = AssistantAgent(
+        storage=storage,
+        intent_planner=SequencedPlanner(
+            [
+                [
+                    ("get_delivery_tasks", {}, "query_intelligence"),
+                    ("get_delivery_tasks", {}, "query_intelligence"),
+                ]
+            ]
+        ),
+    )
+
+    response = agent.respond("列出任务", session_id="session-repeat-guard")
+
+    assert "重复工具调用" in response.message
+
+
+def test_assistant_agent_stops_when_step_limit_is_hit(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    agent = AssistantAgent(
+        storage=storage,
+        intent_planner=SequencedPlanner(
+            [
+                [
+                    ("resolve_event_reference", {"reference_index": 1}, "resolve_reference"),
+                    ("resolve_event_reference", {"reference_index": 2}, "resolve_reference"),
+                    ("resolve_event_reference", {"reference_index": 3}, "resolve_reference"),
+                    ("resolve_event_reference", {"reference_index": 4}, "resolve_reference"),
+                    ("resolve_event_reference", {"reference_index": 5}, "resolve_reference"),
+                    ("resolve_event_reference", {"reference_index": 6}, "resolve_reference"),
+                    ("resolve_event_reference", {"reference_index": 7}, "resolve_reference"),
+                    ("resolve_event_reference", {"reference_index": 8}, "resolve_reference"),
+                ]
+            ]
+        ),
+    )
+
+    response = agent.respond("把最近结果逐个展开", session_id="session-step-limit")
+
+    assert "最大步数限制" in response.message
+
+
 def test_assistant_agent_can_export_report_summary_from_chat(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("NEXTINAI_REPORT_OUTPUT_DIR", str(tmp_path / "exports"))
     get_settings.cache_clear()
@@ -487,8 +653,14 @@ def test_assistant_agent_can_export_report_summary_from_chat(tmp_path, monkeypat
         storage=storage,
         intent_planner=SequencedPlanner(
             [
-                ("get_report_events", {"limit": 1}, "query_intelligence"),
-                ("export_report_summary", {"source_name": "OpenAI News", "formats": ["pdf"]}, "export_intelligence"),
+                [("get_report_events", {"limit": 1}, "query_intelligence")],
+                [
+                    (
+                        "export_report_summary",
+                        {"source_name": "OpenAI News", "limit": 1, "formats": ["pdf"]},
+                        "export_intelligence",
+                    )
+                ],
             ]
         ),
     )
@@ -544,9 +716,19 @@ def test_assistant_agent_can_export_report_detail_from_chat(tmp_path, monkeypatc
         storage=storage,
         intent_planner=SequencedPlanner(
             [
-                ("get_report_events", {"limit": 1}, "query_intelligence"),
-                ("get_event_detail", {"reference_index": 1}, "explore_detail"),
-                ("export_report", {"reference_index": 1, "formats": ["md"]}, "export_intelligence"),
+                [("get_report_events", {"limit": 1}, "query_intelligence")],
+                [
+                    ("resolve_event_reference", {"reference_index": 1}, "resolve_reference"),
+                    ("get_event_detail", lambda messages: {"event_id": _last_tool_output(messages)["event_id"]}, "explore_detail"),
+                ],
+                [
+                    ("prepare_report_export", {"reference_index": 1}, "resolve_reference"),
+                    (
+                        "export_report",
+                        lambda messages: {"report_id": _last_tool_output(messages)["report_id"], "formats": ["md"]},
+                        "export_intelligence",
+                    ),
+                ],
             ]
         ),
     )
