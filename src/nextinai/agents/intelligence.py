@@ -651,24 +651,31 @@ class OpenAIIntelligenceAgent(IntelligenceAgent):
                 source_name=source_name,
                 excerpt_text=excerpt_text,
             )
-        prompt = (
-            "你是 NextInAI 的正文摘录翻译 agent。"
-            "请把下面这段正文摘录翻译成自然、流畅、适合中文读者阅读的中文。"
-            "要求："
-            "1. 忠实原意，不增删核心信息；"
-            "2. 语言自然，不要机械直译；"
-            "3. 保留专有名词、产品名、模型名；"
-            "4. 直接输出译文，不要加说明、不要加括号注释。"
-            f"\n来源：{source_name}\n标题：{title}\n正文摘录：\n{excerpt_text[:8000]}"
-        )
-        translated = self._complete(prompt)
-        if not translated:
+        translated_chunks: list[str] = []
+        for index, chunk in enumerate(self._chunk_translation_text(excerpt_text), start=1):
+            prompt = (
+                "你是 NextInAI 的全文翻译 agent。"
+                "请把下面这段文章正文翻译成自然、流畅、适合中文读者阅读的中文。"
+                "要求："
+                "1. 忠实原意，不增删核心信息；"
+                "2. 语言自然，不要机械直译；"
+                "3. 保留专有名词、产品名、模型名；"
+                "4. 尽量保留原文段落结构；"
+                "5. 直接输出译文，不要加说明、不要加括号注释。"
+                f"\n来源：{source_name}\n标题：{title}\n这是第 {index} 段正文：\n{chunk}"
+            )
+            translated = self._complete(prompt)
+            if not translated:
+                translated_chunks = []
+                break
+            translated_chunks.append(translated.strip())
+        if not translated_chunks:
             return self.fallback.translate_report_excerpt(
                 title=title,
                 source_name=source_name,
                 excerpt_text=excerpt_text,
             )
-        return translated.strip()
+        return "\n\n".join(chunk for chunk in translated_chunks if chunk).strip()
 
     def compose_digest_overview(
         self,
@@ -760,6 +767,33 @@ class OpenAIIntelligenceAgent(IntelligenceAgent):
             key, value = line.split("=", maxsplit=1)
             result[key.strip()] = value.strip()
         return result
+
+    @staticmethod
+    def _chunk_translation_text(text: str, limit: int = 2800) -> list[str]:
+        paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()]
+        if not paragraphs:
+            return [text[:limit]]
+        chunks: list[str] = []
+        current = ""
+        for paragraph in paragraphs:
+            candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+            if len(candidate) <= limit:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+            if len(paragraph) <= limit:
+                current = paragraph
+                continue
+            start = 0
+            while start < len(paragraph):
+                piece = paragraph[start : start + limit]
+                chunks.append(piece.strip())
+                start += limit
+            current = ""
+        if current:
+            chunks.append(current)
+        return chunks
 
     @staticmethod
     def _extract_deep_read_summary(markdown: str, title: str) -> str:

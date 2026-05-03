@@ -8,12 +8,13 @@ import re
 from typing import Any
 from xml.etree import ElementTree
 
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse, urlencode
 
 import httpx
 
 
-BODY_TEXT_LIMIT = 12000
+BODY_TEXT_LIMIT = 50000
+MIN_ARTICLE_TEXT_LENGTH = 120
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -49,6 +50,15 @@ class CollectedReportItem:
     body_text: str | None
     metadata_json: dict[str, Any]
     partial: bool
+
+
+class ManualUrlImportError(ValueError):
+    """Structured failure raised while importing a single article URL."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 DEFAULT_REPORT_SOURCES = [
@@ -208,12 +218,86 @@ class ReportSourceCollector:
         response.raise_for_status()
         return self._parse_feed(source, response.text, progress_callback=progress_callback)
 
+    def import_url(self, url: str, progress_callback=None) -> CollectedReportItem:
+        normalized_url = self.normalize_article_url(url)
+        if progress_callback is not None:
+            progress_callback(f"[手动导入] URL 校验通过：{normalized_url}")
+        try:
+            response = self.client.get(normalized_url, timeout=self.article_timeout)
+        except httpx.HTTPError as exc:
+            raise ManualUrlImportError("network_error", f"页面访问失败：{exc}") from exc
+        final_url = self.normalize_article_url(str(response.url))
+        if response.status_code in {401, 403}:
+            raise ManualUrlImportError("access_denied", f"页面拒绝访问：HTTP {response.status_code}")
+        if response.status_code == 404:
+            raise ManualUrlImportError("not_found", "页面不存在或已被移除。")
+        if response.status_code >= 400:
+            raise ManualUrlImportError("http_error", f"页面访问失败：HTTP {response.status_code}")
+
+        if progress_callback is not None:
+            progress_callback(f"[手动导入] 已获取页面：{final_url}")
+        title = self._extract_html_title(response.text) or self._build_title_from_url(final_url)
+        article_html = self._extract_article_html(response.text)
+        body_text = self._extract_body_text(response.text, article_html=article_html)
+        if not body_text:
+            raise ManualUrlImportError("empty_body", "页面可访问，但未提取到有效正文。")
+        if len(body_text.strip()) < MIN_ARTICLE_TEXT_LENGTH:
+            raise ManualUrlImportError("body_too_short", "正文过短，暂时不适合生成解读和全文翻译。")
+        published_at = self._extract_html_publish_date(article_html or response.text)
+        domain = urlparse(final_url).netloc or "手动导入"
+        summary = self._extract_meta_description(response.text) or body_text[:320]
+        return CollectedReportItem(
+            source_name=domain,
+            title=title.strip(),
+            url=final_url,
+            published_at=published_at,
+            summary_text=self._clean_text(summary),
+            body_text=body_text,
+            metadata_json={
+                "group": "manual",
+                "category": "手动导入",
+                "default_enabled": False,
+                "description": "用户手动输入 URL 导入",
+                "source_url": final_url,
+                "original_url": url.strip(),
+                "normalized_url": final_url,
+                "import_kind": "manual_url",
+            },
+            partial=article_html is None,
+        )
+
+    @staticmethod
+    def normalize_article_url(url: str) -> str:
+        candidate = url.strip()
+        if not candidate:
+            raise ManualUrlImportError("invalid_url", "请输入有效的文章 URL。")
+        parsed = urlparse(candidate)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ManualUrlImportError("invalid_url", "URL 必须以 http:// 或 https:// 开头，且包含域名。")
+        filtered_query = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.lower().startswith("utm_") and key.lower() not in {"fbclid", "gclid", "ref", "ref_src"}
+        ]
+        normalized_path = parsed.path or "/"
+        if normalized_path != "/" and normalized_path.endswith("/"):
+            normalized_path = normalized_path.rstrip("/")
+        return urlunparse(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                normalized_path,
+                "",
+                urlencode(filtered_query, doseq=True),
+                "",
+            )
+        )
+
     def fetch_article_body(self, url: str) -> str | None:
         response = self.client.get(url, timeout=self.article_timeout)
         if response.status_code >= 400:
             return None
-        text = self._strip_html(response.text)
-        text = " ".join(text.split())
+        text = self._extract_body_text(response.text)
         return text[:BODY_TEXT_LIMIT] if text else None
 
     def fetch_article_details(self, url: str) -> tuple[str | None, str | None, str | None]:
@@ -222,8 +306,7 @@ class ReportSourceCollector:
             return None, None, None
         title = self._extract_html_title(response.text)
         article_html = self._extract_article_html(response.text)
-        text = self._strip_html(article_html or response.text)
-        text = " ".join(text.split())
+        text = self._extract_body_text(response.text, article_html=article_html)
         summary = self._extract_meta_description(response.text)
         if summary and text:
             text = f"{summary} {text}"
@@ -341,8 +424,27 @@ class ReportSourceCollector:
 
     @staticmethod
     def _strip_html(value: str) -> str:
-        text = value
-        for token in ["<p>", "</p>", "<br>", "<br/>", "<br />", "</div>", "</li>", "</h1>", "</h2>", "</h3>"]:
+        text = re.sub(r"<(script|style|noscript|svg)[^>]*>.*?</\1>", "", value, flags=re.S | re.I)
+        for token in [
+            "<p>",
+            "</p>",
+            "<br>",
+            "<br/>",
+            "<br />",
+            "</div>",
+            "</section>",
+            "</article>",
+            "</main>",
+            "</li>",
+            "</ul>",
+            "</ol>",
+            "</h1>",
+            "</h2>",
+            "</h3>",
+            "</h4>",
+            "</h5>",
+            "</h6>",
+        ]:
             text = text.replace(token, "\n")
         while "<" in text and ">" in text:
             start = text.find("<")
@@ -387,6 +489,11 @@ class ReportSourceCollector:
         return None
 
     @staticmethod
+    def _build_title_from_url(url: str) -> str:
+        slug = url.rstrip("/").split("/")[-1].replace("-", " ").replace("_", " ").strip()
+        return slug.title() or "Untitled report"
+
+    @staticmethod
     def _extract_meta_description(html_text: str) -> str | None:
         match = re.search(r'<meta\s+(?:name|property)="(?:description|og:description)"\s+content="([^"]+)"', html_text, re.I)
         if not match:
@@ -402,6 +509,47 @@ class ReportSourceCollector:
         if main_match:
             return main_match.group(1)
         return None
+
+    def _extract_body_text(self, html_text: str, *, article_html: str | None = None) -> str | None:
+        text = self._strip_html(article_html or html_text)
+        cleaned = self._clean_rich_text(text)
+        return cleaned[:BODY_TEXT_LIMIT] if cleaned else None
+
+    @staticmethod
+    def looks_like_low_quality_body(text: str | None) -> bool:
+        if not text:
+            return True
+        normalized = text.strip()
+        lowered = normalized.lower()
+        suspicious_markers = [
+            "const guesttheme",
+            "window.matchmedia",
+            "document.documentelement",
+            "__next",
+            "webpack",
+            "cookie.match",
+        ]
+        if any(marker in lowered[:1200] for marker in suspicious_markers):
+            return True
+        if len(normalized) < MIN_ARTICLE_TEXT_LENGTH:
+            return True
+        return False
+
+    @staticmethod
+    def _clean_rich_text(value: str | None) -> str | None:
+        if not value:
+            return None
+        normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+        blocks = re.split(r"\n\s*\n+", normalized)
+        cleaned_blocks: list[str] = []
+        for block in blocks:
+            lines = [" ".join(line.split()) for line in block.splitlines()]
+            compact = " ".join(part for part in lines if part).strip()
+            if compact:
+                cleaned_blocks.append(compact)
+        if not cleaned_blocks:
+            return None
+        return "\n\n".join(cleaned_blocks)
 
     @staticmethod
     def _extract_html_publish_date(html_text: str) -> str | None:

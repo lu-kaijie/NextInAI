@@ -177,6 +177,22 @@ def fetch_reports(source_group: str = typer.Option("default", help="来源组名
     console.print(service.fetch_reports(source_group, progress_callback=_progress))
 
 
+@report_app.command("import-url")
+def import_report_url(url: str = typer.Argument(..., help="单篇文章 URL。")) -> None:
+    """手动导入单篇文章并生成概览。"""
+
+    service = build_service_registry().report_service
+
+    def _progress(message: str) -> None:
+        console.print(f"[cyan]{message}[/cyan]")
+
+    detail = service.import_report_url(url, progress_callback=_progress)
+    console.print(f"[green]导入完成：[/green]{detail['title']}")
+    console.print(f"report_id: {detail['report_id']}")
+    console.print(f"来源: {detail['source_name']}")
+    console.print(f"链接: {detail['url']}")
+
+
 @digest_app.command("generate")
 def generate_digest(
     scope: str = typer.Option("daily", help="简报范围。"),

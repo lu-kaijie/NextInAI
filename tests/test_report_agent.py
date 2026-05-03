@@ -1,5 +1,5 @@
 from nextinai.agents import DeepReportReading, ReportInterpretation, TrendingProjectAnalysis
-from nextinai.collectors.reports import CollectedReportItem, ReportSource
+from nextinai.collectors.reports import CollectedReportItem, ManualUrlImportError, ReportSource
 from nextinai.services.report_agent import AgenticReportService
 from nextinai.storage.files import FileStorage
 
@@ -8,12 +8,30 @@ class FakeReportCollector:
     def __init__(self, items):
         self.items = items
         self.calls = []
+        self.import_item = None
+        self.import_error = None
 
     def collect(self, source: ReportSource, progress_callback=None):
         self.calls.append(source.name)
         if progress_callback is not None:
             progress_callback(f"collector:{source.name}")
         return self.items
+
+    def normalize_article_url(self, url: str) -> str:
+        normalized = url.strip()
+        if not normalized.startswith("http"):
+            raise ManualUrlImportError("invalid_url", "请输入有效的文章 URL。")
+        return normalized.rstrip("/")
+
+    def import_url(self, url: str, progress_callback=None):
+        self.calls.append(("manual", url))
+        if self.import_error is not None:
+            raise self.import_error
+        if progress_callback is not None:
+            progress_callback(f"manual:{url}")
+        if self.import_item is None:
+            raise AssertionError("import_item 未设置")
+        return self.import_item
 
 
 class FakeAnthropicCollector:
@@ -60,6 +78,24 @@ class FakeInterpreter:
         return f"这是一段流畅的中文译文：{title}"
 
 
+class ChunkingOpenAIAgent:
+    def __init__(self) -> None:
+        from nextinai.agents.intelligence import OpenAIIntelligenceAgent
+
+        self.agent = OpenAIIntelligenceAgent(api_key="test", model="fake-model")
+        self.prompts: list[str] = []
+
+        def fake_complete(prompt: str) -> str:
+            self.prompts.append(prompt)
+            marker = f"第 {len(self.prompts)} 段译文"
+            return marker
+
+        self.agent._complete = fake_complete  # type: ignore[attr-defined]
+
+    def translate_report_excerpt(self, *, title, source_name, excerpt_text):
+        return self.agent.translate_report_excerpt(title=title, source_name=source_name, excerpt_text=excerpt_text)
+
+
 def test_report_service_collects_and_interprets_reports(tmp_path) -> None:
     storage = FileStorage(tmp_path)
     collector = FakeReportCollector(
@@ -92,6 +128,22 @@ def test_report_service_collects_and_interprets_reports(tmp_path) -> None:
     assert len(analysis_results) == 1
     assert analysis_results[0]["factual_summary"] == "事实：Introducing a new agent workflow"
     assert analysis_results[0]["interpreted_summary"] == "解读：OpenAI News"
+
+
+def test_report_collector_preserves_paragraph_breaks_for_body_text() -> None:
+    from nextinai.collectors.reports import ReportSourceCollector
+
+    collector = ReportSourceCollector()
+    html = """
+    <article>
+      <p>First paragraph about agent workflows.</p>
+      <p>Second paragraph about evaluation and deployment.</p>
+    </article>
+    """
+
+    body = collector._extract_body_text(html)
+
+    assert body == "First paragraph about agent workflows.\n\nSecond paragraph about evaluation and deployment."
 
 
 def test_anthropic_source_uses_webpage_index_mode(tmp_path) -> None:
@@ -421,6 +473,42 @@ def test_report_service_generates_and_reuses_deep_reading(tmp_path) -> None:
     assert interpreter.deep_read_calls == 2
 
 
+def test_report_service_blocks_deep_reading_when_full_body_is_missing(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    interpreter = FakeInterpreter()
+    service = AgenticReportService(
+        storage=storage,
+        collector=FakeReportCollector([]),
+        agent=interpreter,
+        sources=[ReportSource("OpenAI News", "default", "feed", "https://example.com/feed.xml", category="AI 公司")],
+    )
+    report = CollectedReportItem(
+        source_name="OpenAI News",
+        title="Partial report",
+        url="https://example.com/partial-report",
+        published_at="2026-04-30T00:00:00+00:00",
+        summary_text="only summary",
+        body_text="partial body text",
+        metadata_json={"group": "default", "category": "AI 公司"},
+        partial=True,
+    )
+    fingerprint = service._build_fingerprint(report)
+    storage.save_collection("content_items", [service._build_content_record(report, fingerprint)])
+
+    detail = service.get_report_detail(f"report:{fingerprint}")
+
+    assert detail is not None
+    assert detail["can_deep_read"] is False
+    assert "暂不生成详细解读" in str(detail["deep_read_block_reason"])
+    try:
+        service.generate_deep_report_reading(f"report:{fingerprint}")
+    except ValueError as exc:
+        assert "暂不生成详细解读" in str(exc)
+    else:
+        raise AssertionError("预期缺少完整正文时拒绝生成详细解读")
+    assert interpreter.deep_read_calls == 0
+
+
 def test_report_service_exports_deep_reading_content(tmp_path) -> None:
     storage = FileStorage(tmp_path / "data")
     service = AgenticReportService(
@@ -522,3 +610,149 @@ def test_report_service_keeps_chinese_excerpt_without_translation_changes(tmp_pa
     detail = service.generate_report_excerpt_translation(f"report:{fingerprint}")
 
     assert detail["localized_excerpt_text"] == "这是中文原文摘录，应该直接展示。"
+    assert detail["full_translation_text"] == "这是中文原文摘录，应该直接展示。"
+
+
+def test_report_service_imports_manual_url_and_reuses_cached_content(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    collector = FakeReportCollector([])
+    collector.import_item = CollectedReportItem(
+        source_name="openai.com",
+        title="Where the goblins came from",
+        url="https://openai.com/index/where-the-goblins-came-from",
+        published_at="2026-04-29",
+        summary_text="OpenAI 发布了一篇新文章。",
+        body_text=(
+            "This article explains where the goblins came from in enough detail for full translation. "
+            "It also covers the surrounding context, examples, and implications for readers who need the full body."
+        ),
+        metadata_json={"group": "manual", "category": "手动导入", "normalized_url": "https://openai.com/index/where-the-goblins-came-from"},
+        partial=False,
+    )
+    interpreter = FakeInterpreter()
+    service = AgenticReportService(storage=storage, collector=collector, agent=interpreter, sources=[])
+
+    first = service.import_report_url("https://openai.com/index/where-the-goblins-came-from/")
+    second = service.import_report_url("https://openai.com/index/where-the-goblins-came-from/")
+
+    assert first["title"] == "Where the goblins came from"
+    assert second["report_id"] == first["report_id"]
+    assert collector.calls.count(("manual", "https://openai.com/index/where-the-goblins-came-from")) == 1
+    assert storage.load_collection("analysis_results")[0]["source_ref"] == first["report_id"]
+
+
+def test_report_service_import_url_refetches_when_cached_record_has_no_body(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    collector = FakeReportCollector([])
+    collector.import_item = CollectedReportItem(
+        source_name="openai.com",
+        title="Where the goblins came from",
+        url="https://openai.com/index/where-the-goblins-came-from",
+        published_at="2026-04-29",
+        summary_text="OpenAI 发布了一篇新文章。",
+        body_text="This article now has enough body text after manual import.",
+        metadata_json={"group": "manual", "category": "手动导入", "normalized_url": "https://openai.com/index/where-the-goblins-came-from"},
+        partial=False,
+    )
+    service = AgenticReportService(storage=storage, collector=collector, agent=FakeInterpreter(), sources=[])
+    stale = CollectedReportItem(
+        source_name="OpenAI News",
+        title="Where the goblins came from",
+        url="https://openai.com/index/where-the-goblins-came-from",
+        published_at="2026-04-29",
+        summary_text="旧摘要",
+        body_text=None,
+        metadata_json={"group": "default", "category": "AI 公司", "normalized_url": "https://openai.com/index/where-the-goblins-came-from"},
+        partial=True,
+    )
+    fingerprint = service._build_fingerprint(stale)
+    storage.save_collection("content_items", [service._build_content_record(stale, fingerprint)])
+
+    detail = service.import_report_url("https://openai.com/index/where-the-goblins-came-from/")
+
+    refreshed = service.get_report_detail(str(detail["report_id"]))
+    assert collector.calls.count(("manual", "https://openai.com/index/where-the-goblins-came-from")) == 1
+    assert refreshed is not None
+    assert "enough body text" in str(refreshed["body_text"])
+
+
+def test_report_service_import_url_refetches_legacy_truncated_body(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    collector = FakeReportCollector([])
+    collector.import_item = CollectedReportItem(
+        source_name="anthropic.com",
+        title="Constitutional Classifiers",
+        url="https://www.anthropic.com/research/constitutional-classifiers",
+        published_at="2025-02-03",
+        summary_text="summary",
+        body_text="完整正文 " * 1500,
+        metadata_json={"group": "manual", "category": "手动导入", "normalized_url": "https://www.anthropic.com/research/constitutional-classifiers"},
+        partial=False,
+    )
+    service = AgenticReportService(storage=storage, collector=collector, agent=FakeInterpreter(), sources=[])
+    stale_body = "A" * 3999 + "W"
+    stale = CollectedReportItem(
+        source_name="anthropic.com",
+        title="Constitutional Classifiers",
+        url="https://www.anthropic.com/research/constitutional-classifiers",
+        published_at="2025-02-03",
+        summary_text="summary",
+        body_text=stale_body,
+        metadata_json={"group": "manual", "category": "手动导入", "normalized_url": "https://www.anthropic.com/research/constitutional-classifiers"},
+        partial=False,
+    )
+    fingerprint = service._build_fingerprint(stale)
+    storage.save_collection("content_items", [service._build_content_record(stale, fingerprint)])
+
+    detail = service.import_report_url("https://www.anthropic.com/research/constitutional-classifiers")
+
+    assert collector.calls.count(("manual", "https://www.anthropic.com/research/constitutional-classifiers")) == 1
+    assert len(str(detail["body_text"])) > 4000
+
+
+def test_openai_translation_chunks_full_text() -> None:
+    chunking = ChunkingOpenAIAgent()
+    text = ("Paragraph one.\n\n" + "Paragraph two. " * 300 + "\n\n" + "Paragraph three. " * 300).strip()
+
+    translated = chunking.translate_report_excerpt(
+        title="Long article",
+        source_name="Example",
+        excerpt_text=text,
+    )
+
+    assert "第 1 段译文" in translated
+    assert len(chunking.prompts) >= 2
+
+
+def test_report_service_import_url_rejects_invalid_input(tmp_path) -> None:
+    service = AgenticReportService(
+        storage=FileStorage(tmp_path / "data"),
+        collector=FakeReportCollector([]),
+        agent=FakeInterpreter(),
+        sources=[],
+    )
+
+    try:
+        service.import_report_url("not-a-url")
+    except ValueError as exc:
+        assert "请输入有效的文章 URL" in str(exc)
+    else:
+        raise AssertionError("预期抛出 ValueError")
+
+
+def test_report_service_import_url_records_structured_failures(tmp_path) -> None:
+    storage = FileStorage(tmp_path / "data")
+    collector = FakeReportCollector([])
+    collector.import_error = ManualUrlImportError("empty_body", "页面可访问，但未提取到有效正文。")
+    service = AgenticReportService(storage=storage, collector=collector, agent=FakeInterpreter(), sources=[])
+
+    try:
+        service.import_report_url("https://example.com/empty")
+    except ValueError as exc:
+        assert "未提取到有效正文" in str(exc)
+    else:
+        raise AssertionError("预期抛出 ValueError")
+
+    skips = storage.load_collection("report_skips")
+    assert skips[-1]["source"] == "手动导入"
+    assert "未提取到有效正文" in str(skips[-1]["reason"])

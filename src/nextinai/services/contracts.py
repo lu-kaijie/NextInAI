@@ -51,6 +51,9 @@ class ReportService:
     def fetch_reports(self, source_group: str, progress_callback=None) -> str:
         raise NotImplementedError
 
+    def import_report_url(self, url: str, progress_callback=None) -> dict[str, str | bool | None]:
+        raise NotImplementedError
+
     def list_sources(
         self,
         source_group: str | None = None,
@@ -174,6 +177,9 @@ class CapabilityService:
         raise NotImplementedError
 
     def fetch_reports(self, source_group: str, progress_callback=None) -> str:
+        raise NotImplementedError
+
+    def import_report_url(self, url: str, progress_callback=None) -> dict[str, str | bool | None]:
         raise NotImplementedError
 
     def list_report_sources(

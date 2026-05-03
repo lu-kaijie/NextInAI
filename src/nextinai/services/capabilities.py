@@ -129,6 +129,10 @@ class UnifiedCapabilityService(CapabilityService):
         log_event(self.logger, "抓取报告来源组", source_group=source_group)
         return self.report_service.fetch_reports(source_group, progress_callback=progress_callback)
 
+    def import_report_url(self, url: str, progress_callback=None) -> dict[str, str | bool | None]:
+        log_event(self.logger, "导入单篇报告 URL", url=url)
+        return self.report_service.import_report_url(url, progress_callback=progress_callback)
+
     def list_report_sources(
         self,
         source_group: str | None = None,

@@ -44,6 +44,8 @@ def _ensure_state() -> None:
         st.session_state.selected_report_category = "全部分类"
     if "selected_report_id" not in st.session_state:
         st.session_state.selected_report_id = None
+    if "manual_report_url" not in st.session_state:
+        st.session_state.manual_report_url = ""
 
 
 def _append_runtime_log(message: str) -> None:
@@ -301,14 +303,14 @@ def _render_report_detail_page(capability_service) -> None:
         return
 
     auto_generate = str(st.query_params.get("auto_generate", "")).strip() == "1"
-    if auto_generate and not detail.get("deep_reading_ready"):
+    if auto_generate and not detail.get("deep_reading_ready") and detail.get("can_deep_read"):
         with st.spinner("正在生成详细解读..."):
             detail = capability_service.generate_deep_report_reading(report_id, force=False)
         if "auto_generate" in st.query_params:
             del st.query_params["auto_generate"]
 
-    if detail.get("body_text") and not detail.get("localized_excerpt_text"):
-        with st.spinner("正在生成正文摘录中文译文..."):
+    if detail.get("body_text") and not detail.get("full_translation_text"):
+        with st.spinner("正在生成全文翻译..."):
             detail = capability_service.generate_report_excerpt_translation(report_id, force=False)
 
     back_col, open_col = st.columns([1, 1])
@@ -329,15 +331,33 @@ def _render_report_detail_page(capability_service) -> None:
     meta_cols[1].metric("分类", str(detail.get("source_category") or "未分类"))
     meta_cols[2].metric("发布时间", str(detail.get("published_at") or "未知"))
     meta_cols[3].metric("深读状态", "已生成" if detail.get("deep_reading_ready") else "未生成")
+    if not detail.get("can_deep_read"):
+        st.warning(str(detail.get("deep_read_block_reason") or "当前无法生成详细解读。"))
 
-    action_cols = st.columns(3)
+    action_cols = st.columns(4)
     with action_cols[0]:
-        if st.button("生成 / 刷新详细解读", key="detail-refresh-deep", use_container_width=True):
+        if st.button(
+            "生成 / 刷新详细解读",
+            key="detail-refresh-deep",
+            use_container_width=True,
+            disabled=not bool(detail.get("can_deep_read")),
+        ):
             _append_runtime_log(f"[report] 强制刷新详细解读：{report_id}")
-            with st.spinner("正在生成详细解读..."):
-                detail = capability_service.generate_deep_report_reading(report_id, force=True)
-            st.success("详细解读已刷新。")
+            try:
+                with st.spinner("正在生成详细解读..."):
+                    detail = capability_service.generate_deep_report_reading(report_id, force=True)
+                st.success("详细解读已刷新。")
+            except Exception as exc:
+                st.error(str(exc))
     with action_cols[1]:
+        if st.button("刷新原文正文", key="detail-refresh-body", use_container_width=True):
+            try:
+                with st.spinner("正在重新抓取正文..."):
+                    detail = capability_service.import_report_url(str(detail["url"]))
+                st.success("原文正文已刷新。")
+            except Exception as exc:
+                st.error(str(exc))
+    with action_cols[2]:
         if st.button(
             "导出详细解读 Markdown",
             key="detail-export-md",
@@ -347,7 +367,7 @@ def _render_report_detail_page(capability_service) -> None:
             exported = capability_service.export_report(report_id, ["md"])
             st.success("详细解读 Markdown 导出完成")
             st.json(exported)
-    with action_cols[2]:
+    with action_cols[3]:
         if st.button(
             "导出详细解读 PDF",
             key="detail-export-pdf",
@@ -358,28 +378,40 @@ def _render_report_detail_page(capability_service) -> None:
             st.success("详细解读 PDF 导出完成")
             st.json(exported)
 
-    detail_tabs = st.tabs(["快速概览", "详细解读", "正文翻译"])
+    detail_tabs = st.tabs(["快速概览", "原文正文", "详细解读", "全文翻译"])
     with detail_tabs[0]:
         st.write(f"快速概览：{detail.get('overview_summary') or '暂无'}")
         st.write(f"事实摘要：{detail.get('factual_summary') or detail.get('summary_text') or '暂无'}")
         st.write(f"概览解读：{detail.get('interpreted_summary') or '暂无'}")
     with detail_tabs[1]:
+        body_text = str(detail.get("body_text") or "").strip()
+        if body_text:
+            st.markdown(body_text.replace("\n\n", "\n\n"))
+        else:
+            st.info("当前没有可展示的原文正文。")
+    with detail_tabs[2]:
         if detail.get("deep_reading_markdown"):
             st.markdown(str(detail["deep_reading_markdown"]))
+        elif not detail.get("can_deep_read"):
+            st.info(str(detail.get("deep_read_block_reason") or "当前无法生成详细解读。"))
         else:
             st.info("这篇报告还没有生成详细解读。点击上方按钮后，系统会按需生成长篇带读。")
-    with detail_tabs[2]:
+    with detail_tabs[3]:
         if detail.get("body_text"):
             excerpt_action_cols = st.columns(2)
             with excerpt_action_cols[0]:
-                if st.button("刷新正文翻译", key="detail-refresh-excerpt", use_container_width=True):
-                    with st.spinner("正在刷新正文中文翻译..."):
+                if st.button("刷新全文翻译", key="detail-refresh-excerpt", use_container_width=True):
+                    with st.spinner("正在刷新全文翻译..."):
                         detail = capability_service.generate_report_excerpt_translation(report_id, force=True)
-                    st.success("正文翻译已刷新。")
+                    st.success("全文翻译已刷新。")
             with excerpt_action_cols[1]:
-                generated_at = detail.get("localized_excerpt_generated_at") or "未记录"
-                st.caption(f"正文翻译生成时间：{generated_at}")
-            st.write(detail.get("localized_excerpt_text") or "正文翻译生成中，请稍候。")
+                generated_at = detail.get("full_translation_generated_at") or "未记录"
+                st.caption(f"全文翻译生成时间：{generated_at}")
+            translation_text = str(detail.get("full_translation_text") or "").strip()
+            if translation_text:
+                st.markdown(translation_text)
+            else:
+                st.info("全文翻译生成中，请稍候。")
         else:
             st.info("当前没有可展示的正文内容。")
 
@@ -405,6 +437,25 @@ def _render_report_tab(capability_service, storage: FileStorage) -> None:
     if st.session_state.report_progress:
         with st.expander("抓取进度", expanded=False):
             st.code("\n".join(st.session_state.report_progress))
+
+    st.markdown("### 手动导入文章 URL")
+    with st.form("manual_report_url_form"):
+        manual_url = st.text_input(
+            "文章链接",
+            key="manual_report_url",
+            placeholder="https://openai.com/index/where-the-goblins-came-from/",
+        )
+        submitted = st.form_submit_button("导入并开始阅读", use_container_width=True)
+        if submitted:
+            st.session_state.report_progress = []
+            try:
+                _append_runtime_log(f"[report] 开始手动导入 URL：{manual_url}")
+                detail = capability_service.import_report_url(manual_url, progress_callback=_progress)
+                _append_runtime_log(f"[report] URL 导入完成：{detail.get('title')}")
+                _open_report_detail_page(str(detail["report_id"]), auto_generate=False)
+            except Exception as exc:
+                _append_runtime_log(f"[report] URL 导入失败：{exc}")
+                st.error(str(exc))
 
     st.markdown("### 报告来源")
     source_rows = capability_service.list_report_sources()

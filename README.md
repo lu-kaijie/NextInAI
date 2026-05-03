@@ -44,6 +44,7 @@ NextInAI 是一个面向 AI 情报追踪与主动交付的 Python harness。它�
 - `AI 报告抓取与解读`
   - 抓取预设来源组中的报告类内容
   - 生成“事实摘要 + 解读分析”
+  - 支持手动输入单篇文章 URL，直接生成概览、详细解读和全文翻译
 
 - `Digest 生成与导出`
   - 聚合仓库更新、热门项目和报告解读
@@ -401,6 +402,12 @@ nextinai trending show --window 7d --limit 10
 nextinai report fetch --source-group default
 ```
 
+手动导入单篇文章 URL：
+
+```bash
+nextinai report import-url "https://openai.com/index/where-the-goblins-came-from/"
+```
+
 ### 生成 digest
 
 ```bash
@@ -534,6 +541,9 @@ nextinai task daemon --poll-seconds 5 --max-cycles 2 --force-first-cycle
 
 - `nextinai report fetch --source-group default`
   - 抓取并解读预设来源组中的报告
+
+- `nextinai report import-url "<文章 URL>"`
+  - 手动导入单篇文章，直接生成概览并进入后续详细解读 / 全文翻译链路
 
 ### `digest`
 

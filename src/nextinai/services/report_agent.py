@@ -7,7 +7,13 @@ import hashlib
 from typing import Any
 
 from nextinai.agents import IntelligenceAgent, OpenAIIntelligenceAgent, RuleBasedIntelligenceAgent
-from nextinai.collectors.reports import DEFAULT_REPORT_SOURCES, CollectedReportItem, ReportSource, ReportSourceCollector
+from nextinai.collectors.reports import (
+    DEFAULT_REPORT_SOURCES,
+    CollectedReportItem,
+    ManualUrlImportError,
+    ReportSource,
+    ReportSourceCollector,
+)
 from nextinai.core.config import get_settings
 from nextinai.core.logging import build_progress_callback, get_logger, log_error, log_event
 from nextinai.digests.exporters import DigestExporter
@@ -151,6 +157,67 @@ class AgenticReportService(ReportService):
         )
         return summary
 
+    def import_report_url(self, url: str, progress_callback=None) -> dict[str, str | bool | None]:
+        progress = build_progress_callback(self.logger, progress_callback)
+        progress(f"开始导入文章 URL：{url}")
+        try:
+            normalized_url = self.collector.normalize_article_url(url)
+        except ManualUrlImportError as exc:
+            self._record_report_skip(source="手动导入", reason=exc.message, url=url)
+            raise ValueError(exc.message) from exc
+
+        content_items = self.storage.load_collection("content_items")
+        analysis_results = self.storage.load_collection("analysis_results")
+        existing = self._find_content_by_normalized_url(normalized_url, content_items=content_items)
+        if existing is not None:
+            report_id = f"report:{existing['dedupe_fingerprint']}"
+            if not self._should_refresh_existing_content(existing):
+                progress(f"命中已有缓存：{existing.get('title') or normalized_url}")
+                if not self._find_overview_analysis(report_id, analysis_results=analysis_results):
+                    progress("已有正文但缺少概览解读，正在补生成...")
+                    self._append_overview_analysis(existing, analysis_results)
+                    self.storage.save_collection("analysis_results", analysis_results)
+                detail = self.get_report_detail(report_id)
+                if detail is None:
+                    raise ValueError("命中已有内容，但未能重新读取导入结果。")
+                return detail
+            progress("命中旧缓存但正文缺失或质量较差，准备重新抓取正文...")
+
+        try:
+            item = self.collector.import_url(normalized_url, progress_callback=progress)
+        except ManualUrlImportError as exc:
+            self._record_report_skip(source="手动导入", reason=exc.message, url=normalized_url)
+            raise ValueError(exc.message) from exc
+
+        fingerprint = existing["dedupe_fingerprint"] if existing is not None else self._build_fingerprint(item)
+        record = self._build_content_record(item, fingerprint)
+        if existing is not None:
+            for index, row in enumerate(content_items):
+                if row.get("dedupe_fingerprint") == existing["dedupe_fingerprint"]:
+                    content_items[index] = record
+                    break
+            report_id = f"report:{fingerprint}"
+            analysis_results = [
+                row
+                for row in analysis_results
+                if not (
+                    row.get("source_ref") == report_id
+                    and row.get("analysis_kind") == AnalysisKind.REPORT_INTERPRETATION.value
+                )
+            ]
+            self._delete_related_analysis("deep_report_readings", report_id)
+            self._delete_related_analysis("report_excerpt_translations", report_id)
+        else:
+            content_items.append(record)
+        self._append_overview_analysis(record, analysis_results)
+        self.storage.save_collection("content_items", content_items)
+        self.storage.save_collection("analysis_results", analysis_results)
+        progress(f"导入完成：{item.title}")
+        detail = self.get_report_detail(f"report:{fingerprint}")
+        if detail is None:
+            raise ValueError("导入完成，但未能读取文章详情。")
+        return detail
+
     def list_sources(
         self,
         source_group: str | None = None,
@@ -266,6 +333,8 @@ class AgenticReportService(ReportService):
             or content.get("summary_text")
             or "暂无概览摘要"
         )
+        can_deep_read = bool(content.get("body_text")) and not bool(content.get("partial"))
+        deep_read_block_reason = None if can_deep_read else "当前未获取到完整正文，为避免误导，暂不生成详细解读。"
         return {
             "report_id": report_id,
             "source_name": str(content.get("source_key") or ""),
@@ -280,18 +349,24 @@ class AgenticReportService(ReportService):
             "interpreted_summary": analysis.get("interpreted_summary"),
             "has_analysis": bool(analysis),
             "is_partial": bool(content.get("partial")),
+            "can_deep_read": can_deep_read,
+            "deep_read_block_reason": deep_read_block_reason,
             "deep_reading_ready": bool(deep_reading),
             "deep_reading_markdown": deep_reading.get("markdown_body"),
             "deep_reading_summary": deep_reading.get("summary"),
             "deep_reading_generated_at": deep_reading.get("generated_at"),
             "localized_excerpt_text": excerpt_translation.get("translated_text"),
             "localized_excerpt_generated_at": excerpt_translation.get("generated_at"),
+            "full_translation_text": excerpt_translation.get("translated_text"),
+            "full_translation_generated_at": excerpt_translation.get("generated_at"),
         }
 
     def generate_deep_report_reading(self, report_id: str, force: bool = False) -> dict[str, str | bool | None]:
         detail = self.get_report_detail(report_id)
         if detail is None:
             raise ValueError("未找到可深读的报告。")
+        if not detail.get("can_deep_read"):
+            raise ValueError(str(detail.get("deep_read_block_reason") or "当前无法生成详细解读。"))
         if detail.get("deep_reading_ready") and not force:
             return detail
 
@@ -373,7 +448,7 @@ class AgenticReportService(ReportService):
         self.storage.save_collection("report_excerpt_translations", records)
         refreshed = self.get_report_detail(report_id)
         if refreshed is None:
-            raise ValueError("正文摘录译文生成后未能重新读取详情。")
+            raise ValueError("正文全文翻译生成后未能重新读取详情。")
         return refreshed
 
     def export_report(self, report_id: str, formats: list[str]) -> dict[str, str]:
@@ -430,11 +505,17 @@ class AgenticReportService(ReportService):
             None,
         )
 
-    def _find_overview_analysis(self, report_id: str) -> dict[str, Any] | None:
+    def _find_overview_analysis(
+        self,
+        report_id: str,
+        *,
+        analysis_results: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        rows = analysis_results if analysis_results is not None else self.storage.load_collection("analysis_results")
         return next(
             (
                 item
-                for item in self.storage.load_collection("analysis_results")
+                for item in rows
                 if item.get("analysis_kind") == AnalysisKind.REPORT_INTERPRETATION.value
                 and item.get("source_ref") == report_id
             ),
@@ -474,16 +555,19 @@ class AgenticReportService(ReportService):
 
     @staticmethod
     def _build_fingerprint(item: CollectedReportItem) -> str:
-        return hashlib.sha256(f"{item.source_name}|{item.url}|{item.title}".encode("utf-8")).hexdigest()
+        normalized_url = item.metadata_json.get("normalized_url") or ReportSourceCollector.normalize_article_url(item.url)
+        return hashlib.sha256(f"{normalized_url}|{item.title}".encode("utf-8")).hexdigest()
 
     @staticmethod
     def _build_content_record(item: CollectedReportItem, fingerprint: str) -> dict[str, Any]:
+        normalized_url = item.metadata_json.get("normalized_url") or ReportSourceCollector.normalize_article_url(item.url)
         return {
             "source_kind": SourceKind.AI_REPORT.value,
             "source_key": item.source_name,
             "signal_type": EventSignal.REPORT_PUBLICATION.value,
             "title": item.title,
             "url": item.url,
+            "normalized_url": normalized_url,
             "external_id": None,
             "published_at": item.published_at,
             "summary_text": item.summary_text,
@@ -515,6 +599,8 @@ class AgenticReportService(ReportService):
                 f"- 发布时间: {detail.get('published_at') or '未知'}",
                 f"- 链接: {detail['url']}",
             ]
+            if detail.get("full_translation_text"):
+                lines.extend(["", "## 全文翻译", str(detail["full_translation_text"]).strip()])
             return "\n".join(lines).strip()
         lines = [
             f"# {detail['title']}",
@@ -531,8 +617,93 @@ class AgenticReportService(ReportService):
         ]
         body_text = detail.get("body_text")
         if body_text:
-            lines.extend(["", "## 正文摘录", str(body_text)])
+            lines.extend(["", "## 原文正文", str(body_text)])
+        if detail.get("full_translation_text"):
+            lines.extend(["", "## 全文翻译", str(detail["full_translation_text"])])
         return "\n".join(lines).strip()
+
+    def _append_overview_analysis(self, content: dict[str, Any], analysis_results: list[dict[str, Any]]) -> None:
+        report_id = f"report:{content['dedupe_fingerprint']}"
+        interpretation = self.agent.interpret_report(
+            title=str(content.get("title") or ""),
+            source_name=str(content.get("source_key") or ""),
+            url=str(content.get("url") or ""),
+            summary_text=content.get("summary_text"),
+            body_text=content.get("body_text"),
+        )
+        analysis_results.append(
+            {
+                "analysis_kind": AnalysisKind.REPORT_INTERPRETATION.value,
+                "source_ref": report_id,
+                "title": content.get("title"),
+                "factual_summary": interpretation.factual_summary,
+                "interpreted_summary": interpretation.interpreted_summary,
+                "evidence_json": interpretation.evidence,
+                "is_partial": interpretation.is_partial,
+            }
+        )
+
+    def _record_report_skip(
+        self,
+        *,
+        source: str,
+        reason: str,
+        title: str | None = None,
+        url: str | None = None,
+    ) -> None:
+        report_skips = self.storage.load_collection("report_skips")
+        report_skips.append({"source": source, "title": title, "url": url, "reason": reason})
+        self.storage.save_collection("report_skips", report_skips)
+
+    def _delete_related_analysis(self, collection_name: str, report_id: str) -> None:
+        rows = [item for item in self.storage.load_collection(collection_name) if item.get("source_ref") != report_id]
+        self.storage.save_collection(collection_name, rows)
+
+    def _should_refresh_existing_content(self, content: dict[str, Any]) -> bool:
+        body_text = str(content.get("body_text") or "")
+        if not body_text.strip():
+            return True
+        if bool(content.get("partial")):
+            return True
+        if self._looks_like_legacy_truncated_body(body_text):
+            return True
+        return ReportSourceCollector.looks_like_low_quality_body(body_text)
+
+    @staticmethod
+    def _looks_like_legacy_truncated_body(body_text: str) -> bool:
+        trimmed = body_text.strip()
+        if len(trimmed) in {4000, 12000}:
+            tail = trimmed[-80:]
+            if not any(tail.endswith(symbol) for symbol in ("。", "！", "？", ".", "!", "?", "\"", "'", "”")):
+                return True
+        return False
+
+    def _find_content_by_normalized_url(
+        self,
+        normalized_url: str,
+        *,
+        content_items: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        rows = content_items if content_items is not None else self.storage.load_collection("content_items")
+        return next(
+            (
+                item
+                for item in rows
+                if item.get("source_kind") == SourceKind.AI_REPORT.value
+                and self._resolve_normalized_url(item) == normalized_url
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _resolve_normalized_url(content: dict[str, Any]) -> str:
+        stored = content.get("normalized_url")
+        if stored:
+            return str(stored)
+        metadata = content.get("metadata_json") or {}
+        if metadata.get("normalized_url"):
+            return str(metadata["normalized_url"])
+        return ReportSourceCollector.normalize_article_url(str(content.get("url") or ""))
 
     @staticmethod
     def _build_export_slug(detail: dict[str, str | bool | None]) -> str:
