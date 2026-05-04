@@ -46,11 +46,38 @@ def _ensure_state() -> None:
         st.session_state.selected_report_id = None
     if "manual_report_url" not in st.session_state:
         st.session_state.manual_report_url = ""
+    if "daily_news_progress" not in st.session_state:
+        st.session_state.daily_news_progress = []
+    if "selected_news_source" not in st.session_state:
+        st.session_state.selected_news_source = "全部来源"
+    if "selected_news_category" not in st.session_state:
+        st.session_state.selected_news_category = "全部分类"
+    if "daily_news_auto_loaded" not in st.session_state:
+        st.session_state.daily_news_auto_loaded = False
 
 
 def _append_runtime_log(message: str) -> None:
     st.session_state.runtime_logs.append(message)
     st.session_state.runtime_logs = st.session_state.runtime_logs[-200:]
+
+
+def _fulltext_status_label(status: str | None) -> str:
+    mapping = {
+        "full": "完整正文",
+        "partial": "正文不完整",
+        "restricted": "站点限制",
+        "failed": "抓取失败",
+    }
+    return mapping.get(str(status or "").strip(), "未知状态")
+
+
+def _render_body_text(body_text: str) -> None:
+    paragraphs = [paragraph.strip() for paragraph in str(body_text).split("\n\n") if paragraph.strip()]
+    if not paragraphs:
+        st.info("当前没有可展示的原文正文。")
+        return
+    for paragraph in paragraphs:
+        st.markdown(paragraph)
 
 
 def _open_report_detail_page(report_id: str, auto_generate: bool = False) -> None:
@@ -322,15 +349,19 @@ def _render_report_detail_page(capability_service) -> None:
 
     st.title(str(detail["title"]))
     st.caption(
+        f"{'调查报告' if detail.get('source_role') == 'research_report' else '每日新闻'} | "
         f"{detail['source_name']} | {detail.get('source_category') or '未分类'} | "
         f"{detail.get('published_at') or '未知时间'}"
     )
 
-    meta_cols = st.columns(4)
+    meta_cols = st.columns(5)
     meta_cols[0].metric("来源", str(detail["source_name"]))
     meta_cols[1].metric("分类", str(detail.get("source_category") or "未分类"))
     meta_cols[2].metric("发布时间", str(detail.get("published_at") or "未知"))
-    meta_cols[3].metric("深读状态", "已生成" if detail.get("deep_reading_ready") else "未生成")
+    meta_cols[3].metric("正文状态", _fulltext_status_label(str(detail.get("fulltext_status") or "")))
+    meta_cols[4].metric("深读状态", "已生成" if detail.get("deep_reading_ready") else "未生成")
+    if detail.get("fulltext_reason"):
+        st.info(f"正文状态说明：{detail['fulltext_reason']}")
     if not detail.get("can_deep_read"):
         st.warning(str(detail.get("deep_read_block_reason") or "当前无法生成详细解读。"))
 
@@ -386,7 +417,7 @@ def _render_report_detail_page(capability_service) -> None:
     with detail_tabs[1]:
         body_text = str(detail.get("body_text") or "").strip()
         if body_text:
-            st.markdown(body_text.replace("\n\n", "\n\n"))
+            _render_body_text(body_text)
         else:
             st.info("当前没有可展示的原文正文。")
     with detail_tabs[2]:
@@ -409,7 +440,7 @@ def _render_report_detail_page(capability_service) -> None:
                 st.caption(f"全文翻译生成时间：{generated_at}")
             translation_text = str(detail.get("full_translation_text") or "").strip()
             if translation_text:
-                st.markdown(translation_text)
+                _render_body_text(translation_text)
             else:
                 st.info("全文翻译生成中，请稍候。")
         else:
@@ -417,7 +448,8 @@ def _render_report_detail_page(capability_service) -> None:
 
 
 def _render_report_tab(capability_service, storage: FileStorage) -> None:
-    st.subheader("AI 报告抓取与解读")
+    st.subheader("调查报告")
+    st.caption("聚焦长篇研究、实验复盘、政策研究与公司深度文章。")
 
     def _progress(message: str) -> None:
         st.session_state.report_progress.append(message)
@@ -426,8 +458,8 @@ def _render_report_tab(capability_service, storage: FileStorage) -> None:
     if st.button("抓取默认来源组", use_container_width=True):
         st.session_state.report_progress = []
         try:
-            _append_runtime_log("[report] 开始抓取默认来源组")
-            result = capability_service.fetch_reports("default", progress_callback=_progress)
+            _append_runtime_log("[report] 开始抓取调查报告来源")
+            result = capability_service.fetch_reports("default", progress_callback=_progress, source_role="research_report")
             _append_runtime_log(f"[report] 抓取完成：{result}")
             st.success(result)
         except Exception as exc:
@@ -457,8 +489,8 @@ def _render_report_tab(capability_service, storage: FileStorage) -> None:
                 _append_runtime_log(f"[report] URL 导入失败：{exc}")
                 st.error(str(exc))
 
-    st.markdown("### 报告来源")
-    source_rows = capability_service.list_report_sources()
+    st.markdown("### 调查报告来源")
+    source_rows = capability_service.list_report_sources(source_role="research_report")
     if source_rows:
         grouped_sources = group_sources_by_category(source_rows)
         for category, rows in grouped_sources.items():
@@ -494,20 +526,37 @@ def _render_report_tab(capability_service, storage: FileStorage) -> None:
         report_limit = st.slider("展示数量", min_value=4, max_value=24, value=12, step=2)
     active_source = None if selected_source == "全部来源" else selected_source
     active_category = None if selected_category == "全部分类" else selected_category
-    reports = capability_service.list_reports(source_name=active_source, limit=report_limit, source_category=active_category)
+    reports = capability_service.list_reports(
+        source_name=active_source,
+        limit=report_limit,
+        source_category=active_category,
+        source_role="research_report",
+    )
 
-    st.markdown("### 最近报告")
+    st.markdown("### 最近调查报告")
     if reports:
         summary_export_cols = st.columns(2)
         with summary_export_cols[0]:
             if st.button("导出当前报告摘要 Markdown", use_container_width=True):
-                exported = capability_service.export_report_summary(active_source, report_limit, ["md"], source_category=active_category)
+                exported = capability_service.export_report_summary(
+                    active_source,
+                    report_limit,
+                    ["md"],
+                    source_category=active_category,
+                    source_role="research_report",
+                )
                 _append_runtime_log(f"[report] 已导出报告摘要 Markdown：{active_source or active_category or '全部来源'}")
                 st.success("报告摘要 Markdown 导出完成")
                 st.json(exported)
         with summary_export_cols[1]:
             if st.button("导出当前报告摘要 PDF", use_container_width=True):
-                exported = capability_service.export_report_summary(active_source, report_limit, ["pdf"], source_category=active_category)
+                exported = capability_service.export_report_summary(
+                    active_source,
+                    report_limit,
+                    ["pdf"],
+                    source_category=active_category,
+                    source_role="research_report",
+                )
                 _append_runtime_log(f"[report] 已导出报告摘要 PDF：{active_source or active_category or '全部来源'}")
                 st.success("报告摘要 PDF 导出完成")
                 st.json(exported)
@@ -523,9 +572,11 @@ def _render_report_tab(capability_service, storage: FileStorage) -> None:
                         )
                         st.write(report.get("overview_summary") or "暂无概览摘要")
                         status_text = "已生成详细解读" if report.get("deep_reading_ready") else "未生成详细解读"
-                        if report.get("is_partial"):
-                            status_text += " | 正文抓取不完整"
+                        if report.get("fulltext_status"):
+                            status_text += f" | {_fulltext_status_label(str(report.get('fulltext_status')))}"
                         st.caption(status_text)
+                        if report.get("fulltext_reason"):
+                            st.info(str(report.get("fulltext_reason")))
 
                         action_cols = st.columns(3)
                         report_id = str(report["report_id"])
@@ -573,6 +624,145 @@ def _render_report_tab(capability_service, storage: FileStorage) -> None:
                 st.write(line)
         else:
             st.info("当前没有抓取问题记录。")
+
+
+def _render_daily_news_tab(capability_service, storage: FileStorage) -> None:
+    st.subheader("每日新闻")
+    st.caption("主动展示官方动态、社区讨论和 AI 新闻流，默认看标题、来源和总结。")
+
+    def _progress(message: str) -> None:
+        st.session_state.daily_news_progress.append(message)
+        _append_runtime_log(f"[daily-news] {message}")
+
+    existing_news = capability_service.list_daily_news(limit=12)
+    if not existing_news and not st.session_state.daily_news_auto_loaded:
+        st.session_state.daily_news_auto_loaded = True
+        try:
+            st.session_state.daily_news_progress = []
+            _append_runtime_log("[daily-news] 首次进入页面，自动抓取默认新闻来源")
+            with st.spinner("首次进入页面，正在自动抓取每日新闻..."):
+                result = capability_service.fetch_reports("default", progress_callback=_progress, source_role="daily_news")
+            _append_runtime_log(f"[daily-news] 自动抓取完成：{result}")
+            st.success(result)
+            existing_news = capability_service.list_daily_news(limit=12)
+        except Exception as exc:
+            _append_runtime_log(f"[daily-news] 自动抓取失败：{exc}")
+            st.warning(f"自动抓取每日新闻失败：{exc}")
+
+    news_action_cols = st.columns([1, 1])
+    with news_action_cols[0]:
+        if st.button("抓取默认新闻来源", use_container_width=True):
+            st.session_state.daily_news_progress = []
+            try:
+                _append_runtime_log("[daily-news] 手动抓取默认新闻来源")
+                result = capability_service.fetch_reports("default", progress_callback=_progress, source_role="daily_news")
+                _append_runtime_log(f"[daily-news] 抓取完成：{result}")
+                st.success(result)
+            except Exception as exc:
+                _append_runtime_log(f"[daily-news] 抓取失败：{exc}")
+                st.error(str(exc))
+    with news_action_cols[1]:
+        if st.button("刷新新闻列表", use_container_width=True):
+            st.rerun()
+
+    if st.session_state.daily_news_progress:
+        with st.expander("新闻抓取进度", expanded=False):
+            st.code("\n".join(st.session_state.daily_news_progress))
+
+    source_rows = capability_service.list_report_sources(source_role="daily_news")
+    filter_cols = st.columns([1, 1, 1])
+    with filter_cols[0]:
+        category_options = build_source_category_options(source_rows)
+        if st.session_state.selected_news_category not in category_options:
+            st.session_state.selected_news_category = category_options[0]
+        selected_category = st.selectbox("按分类筛选", category_options, key="selected_news_category")
+    with filter_cols[1]:
+        source_options = build_source_name_options(source_rows, selected_category)
+        if st.session_state.selected_news_source not in source_options:
+            st.session_state.selected_news_source = source_options[0]
+        selected_source = st.selectbox("按来源筛选", source_options, key="selected_news_source")
+    with filter_cols[2]:
+        news_limit = st.slider("展示数量", min_value=6, max_value=24, value=12, step=3, key="daily-news-limit")
+
+    active_source = None if selected_source == "全部来源" else selected_source
+    active_category = None if selected_category == "全部分类" else selected_category
+    news_rows = capability_service.list_daily_news(
+        source_name=active_source,
+        limit=int(news_limit),
+        source_category=active_category,
+    )
+
+    st.markdown("### 最近新闻")
+    if news_rows:
+        export_cols = st.columns(2)
+        with export_cols[0]:
+            if st.button("导出当前新闻摘要 Markdown", use_container_width=True):
+                exported = capability_service.export_report_summary(
+                    active_source,
+                    int(news_limit),
+                    ["md"],
+                    source_category=active_category,
+                    source_role="daily_news",
+                )
+                _append_runtime_log(f"[daily-news] 已导出新闻摘要 Markdown：{active_source or active_category or '全部来源'}")
+                st.success("新闻摘要 Markdown 导出完成")
+                st.json(exported)
+        with export_cols[1]:
+            if st.button("导出当前新闻摘要 PDF", use_container_width=True):
+                exported = capability_service.export_report_summary(
+                    active_source,
+                    int(news_limit),
+                    ["pdf"],
+                    source_category=active_category,
+                    source_role="daily_news",
+                )
+                _append_runtime_log(f"[daily-news] 已导出新闻摘要 PDF：{active_source or active_category or '全部来源'}")
+                st.success("新闻摘要 PDF 导出完成")
+                st.json(exported)
+        for row_index, news_row in enumerate(chunk_reports(news_rows, columns=2)):
+            columns = st.columns(2)
+            for col_index, item in enumerate(news_row):
+                with columns[col_index]:
+                    with st.container(border=True):
+                        st.markdown(f"#### {item['title']}")
+                        st.caption(
+                            f"{item['source_name']} | {item.get('source_category') or '未分类'} | "
+                            f"{item.get('published_at') or '未知时间'}"
+                        )
+                        st.write(item.get("overview_summary") or "暂无总结")
+                        status = _fulltext_status_label(str(item.get("fulltext_status") or ""))
+                        st.caption(f"正文状态：{status}")
+                        if item.get("fulltext_reason"):
+                            st.info(str(item.get("fulltext_reason")))
+                        action_cols = st.columns(3)
+                        report_id = str(item["report_id"])
+                        with action_cols[0]:
+                            if st.button("打开阅读页", key=f"news-open-{row_index}-{col_index}", use_container_width=True):
+                                _append_runtime_log(f"[daily-news] 打开新闻阅读页：{report_id}")
+                                _open_report_detail_page(report_id, auto_generate=False)
+                        with action_cols[1]:
+                            if st.button("生成详细解读", key=f"news-deep-{row_index}-{col_index}", use_container_width=True):
+                                _append_runtime_log(f"[daily-news] 打开新闻阅读页并尝试深读：{report_id}")
+                                _open_report_detail_page(report_id, auto_generate=True)
+                        with action_cols[2]:
+                            st.link_button("原文链接", str(item["url"]), use_container_width=True)
+    else:
+        st.info("当前还没有可展示的每日新闻。")
+
+    with st.expander("新闻来源", expanded=False):
+        if source_rows:
+            grouped_sources = group_sources_by_category(source_rows)
+            for category, rows in grouped_sources.items():
+                st.markdown(f"**{category}**")
+                for row in rows:
+                    latest = row.get("latest_published_at") or "暂无"
+                    st.write(
+                        f"{row['source_name']} | 抓取文章数 {row.get('report_count') or 0} | 最近发布时间 {latest}"
+                    )
+                    if row.get("last_issue"):
+                        st.caption(f"最近问题：{row.get('last_issue')}")
+        else:
+            st.info("当前还没有新闻来源。")
 
 
 def _render_digest_tab(capability_service) -> None:
@@ -675,7 +865,7 @@ def main() -> None:
     st.title("NextInAI 前端控制台")
     st.caption("围绕 AI 情报追踪、对话分析、简报生成和主动交付的一体化本地前端。")
 
-    tabs = st.tabs(["Chat", "订阅", "热门榜", "报告", "简报", "任务"])
+    tabs = st.tabs(["Chat", "订阅", "热门榜", "调查报告", "每日新闻", "简报", "任务"])
     with tabs[0]:
         _render_chat_tab(agent)
     with tabs[1]:
@@ -685,8 +875,10 @@ def main() -> None:
     with tabs[3]:
         _render_report_tab(capability_service, storage)
     with tabs[4]:
-        _render_digest_tab(capability_service)
+        _render_daily_news_tab(capability_service, storage)
     with tabs[5]:
+        _render_digest_tab(capability_service)
+    with tabs[6]:
         _render_task_tab(storage)
 
 

@@ -338,8 +338,65 @@ def test_report_service_lists_sources_reports_and_detail(tmp_path) -> None:
     assert sources[0]["category"] == "AI 公司"
     assert reports[0]["title"] == "Agent roadmap update"
     assert reports[0]["deep_reading_ready"] is False
+    assert reports[0]["fulltext_status"] == "full"
     assert detail is not None
     assert detail["interpreted_summary"] == "解读：OpenAI News"
+    assert detail["source_role"] == "daily_news"
+
+
+def test_report_service_filters_research_reports_and_daily_news(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    service = AgenticReportService(
+        storage=storage,
+        collector=FakeReportCollector([]),
+        agent=FakeInterpreter(),
+        sources=[
+            ReportSource("Anthropic Research", "company", "webpage_index", "https://example.com/research", source_role="research_report", category="AI 公司"),
+            ReportSource("OpenAI News", "default", "feed", "https://example.com/news.xml", source_role="daily_news", category="AI 公司"),
+        ],
+    )
+    research = CollectedReportItem(
+        source_name="Anthropic Research",
+        title="Project Vend 2",
+        url="https://example.com/research/vend-2",
+        published_at="2026-05-01",
+        summary_text="research summary",
+        body_text="full research body",
+        metadata_json={"group": "company", "category": "AI 公司", "source_role": "research_report"},
+        partial=False,
+        fulltext_status="full",
+    )
+    news = CollectedReportItem(
+        source_name="OpenAI News",
+        title="OpenAI launches update",
+        url="https://example.com/news/update",
+        published_at="2026-05-02",
+        summary_text="news summary",
+        body_text="news body",
+        metadata_json={"group": "default", "category": "AI 公司", "source_role": "daily_news"},
+        partial=False,
+        fulltext_status="full",
+    )
+    research_fp = service._build_fingerprint(research)
+    news_fp = service._build_fingerprint(news)
+    storage.save_collection(
+        "content_items",
+        [
+            service._build_content_record(research, research_fp),
+            service._build_content_record(news, news_fp),
+        ],
+    )
+
+    research_rows = service.list_reports(limit=10, source_role="research_report")
+    news_rows = service.list_daily_news(limit=10)
+    source_rows = service.list_sources(source_role="research_report")
+
+    assert len(research_rows) == 1
+    assert research_rows[0]["title"] == "Project Vend 2"
+    assert len(news_rows) == 1
+    assert news_rows[0]["title"] == "OpenAI launches update"
+    assert len(source_rows) == 1
+    assert source_rows[0]["source_name"] == "Anthropic Research"
 
 
 def test_report_service_can_export_report_detail(tmp_path) -> None:
@@ -498,6 +555,7 @@ def test_report_service_blocks_deep_reading_when_full_body_is_missing(tmp_path) 
     detail = service.get_report_detail(f"report:{fingerprint}")
 
     assert detail is not None
+    assert detail["fulltext_status"] == "partial"
     assert detail["can_deep_read"] is False
     assert "暂不生成详细解读" in str(detail["deep_read_block_reason"])
     try:

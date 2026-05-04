@@ -1,4 +1,9 @@
-## ADDED Requirements
+# tool-resolution-and-validation
+
+## Purpose
+定义 assistant 在工具执行前的目标解析、参数校验与错误反馈边界。
+
+## Requirements
 
 ### Requirement: The system SHALL expose resolver tools for state-dependent target resolution
 对于依赖会话状态、最近结果或引用编号的目标解析，系统 MUST 通过 resolver 工具对 planner 显式暴露解析能力，而不是要求 assistant 在业务工具执行前静默完成这类解析。

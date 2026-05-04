@@ -1,4 +1,9 @@
-## ADDED Requirements
+# agent-loop-orchestration
+
+## Purpose
+定义 assistant 单一路径 agent loop 的编排约束、终止条件与工具调度边界。
+
+## Requirements
 
 ### Requirement: Assistant SHALL run all user requests through a single bounded agent loop
 系统 MUST 使用单一的多步 agent loop 处理 chat、web 和 CLI 入口发起的 assistant 请求。planner 每一轮 SHALL 基于当前消息、会话状态和工具结果决定下一步动作；assistant MUST 在满足退出条件前持续执行该循环，而不是切换到其他调度分支。

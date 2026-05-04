@@ -48,7 +48,12 @@ class TrendingService:
 
 
 class ReportService:
-    def fetch_reports(self, source_group: str, progress_callback=None) -> str:
+    def fetch_reports(
+        self,
+        source_group: str,
+        progress_callback=None,
+        source_role: str | None = None,
+    ) -> str:
         raise NotImplementedError
 
     def import_report_url(self, url: str, progress_callback=None) -> dict[str, str | bool | None]:
@@ -58,10 +63,20 @@ class ReportService:
         self,
         source_group: str | None = None,
         source_category: str | None = None,
+        source_role: str | None = None,
     ) -> list[dict[str, str | int | bool | None]]:
         raise NotImplementedError
 
     def list_reports(
+        self,
+        source_name: str | None = None,
+        limit: int = 10,
+        source_category: str | None = None,
+        source_role: str | None = None,
+    ) -> list[dict[str, str | bool | None]]:
+        raise NotImplementedError
+
+    def list_daily_news(
         self,
         source_name: str | None = None,
         limit: int = 10,
@@ -91,6 +106,7 @@ class ReportService:
         limit: int,
         formats: list[str],
         source_category: str | None = None,
+        source_role: str | None = None,
     ) -> dict[str, str]:
         raise NotImplementedError
 
@@ -176,7 +192,12 @@ class CapabilityService:
     def export_trending(self, window: str, limit: int, formats: list[str]) -> dict[str, str]:
         raise NotImplementedError
 
-    def fetch_reports(self, source_group: str, progress_callback=None) -> str:
+    def fetch_reports(
+        self,
+        source_group: str,
+        progress_callback=None,
+        source_role: str | None = None,
+    ) -> str:
         raise NotImplementedError
 
     def import_report_url(self, url: str, progress_callback=None) -> dict[str, str | bool | None]:
@@ -186,10 +207,20 @@ class CapabilityService:
         self,
         source_group: str | None = None,
         source_category: str | None = None,
+        source_role: str | None = None,
     ) -> list[dict[str, str | int | bool | None]]:
         raise NotImplementedError
 
     def list_reports(
+        self,
+        source_name: str | None = None,
+        limit: int = 10,
+        source_category: str | None = None,
+        source_role: str | None = None,
+    ) -> list[dict[str, str | bool | None]]:
+        raise NotImplementedError
+
+    def list_daily_news(
         self,
         source_name: str | None = None,
         limit: int = 10,
@@ -219,6 +250,7 @@ class CapabilityService:
         limit: int,
         formats: list[str],
         source_category: str | None = None,
+        source_role: str | None = None,
     ) -> dict[str, str]:
         raise NotImplementedError
 

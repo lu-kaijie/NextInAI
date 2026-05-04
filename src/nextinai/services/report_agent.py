@@ -56,12 +56,23 @@ class AgenticReportService(ReportService):
         else:
             self.agent = RuleBasedIntelligenceAgent()
 
-    def fetch_reports(self, source_group: str, progress_callback=None) -> str:
-        selected_sources = self._select_sources_for_fetch(source_group)
+    def fetch_reports(
+        self,
+        source_group: str,
+        progress_callback=None,
+        source_role: str | None = None,
+    ) -> str:
+        selected_sources = self._select_sources_for_fetch(source_group, source_role=source_role)
         if not selected_sources:
             raise ValueError(f"未找到来源组：{source_group}")
         progress = build_progress_callback(self.logger, progress_callback)
-        log_event(self.logger, "开始抓取报告来源组", source_group=source_group, source_count=len(selected_sources))
+        log_event(
+            self.logger,
+            "开始抓取报告来源组",
+            source_group=source_group,
+            source_role=source_role,
+            source_count=len(selected_sources),
+        )
 
         content_items = self.storage.load_collection("content_items")
         analysis_results = self.storage.load_collection("analysis_results")
@@ -222,6 +233,7 @@ class AgenticReportService(ReportService):
         self,
         source_group: str | None = None,
         source_category: str | None = None,
+        source_role: str | None = None,
     ) -> list[dict[str, str | int | bool | None]]:
         content_items = self.storage.load_collection("content_items")
         report_skips = self.storage.load_collection("report_skips")
@@ -230,6 +242,8 @@ class AgenticReportService(ReportService):
             if source_group is not None and source.group != source_group and source_group != "default":
                 continue
             if source_category is not None and source.category != source_category:
+                continue
+            if source_role is not None and source.source_role != source_role:
                 continue
             matched = [
                 item
@@ -250,6 +264,7 @@ class AgenticReportService(ReportService):
                     "kind": source.kind,
                     "url": source.url,
                     "description": source.description,
+                    "source_role": source.source_role,
                     "default_enabled": source.default_enabled,
                     "report_count": len(matched),
                     "latest_published_at": latest,
@@ -265,6 +280,7 @@ class AgenticReportService(ReportService):
         source_name: str | None = None,
         limit: int = 10,
         source_category: str | None = None,
+        source_role: str | None = None,
     ) -> list[dict[str, str | bool | None]]:
         analysis_index = {
             row.get("source_ref"): row
@@ -283,6 +299,9 @@ class AgenticReportService(ReportService):
                 continue
             category = self._resolve_source_category(item)
             if source_category is not None and category != source_category:
+                continue
+            resolved_source_role = self._resolve_source_role(item)
+            if source_role is not None and resolved_source_role != source_role:
                 continue
             rows.append(item)
         rows.sort(key=lambda item: (item.get("published_at") or "", item.get("title") or ""), reverse=True)
@@ -303,6 +322,7 @@ class AgenticReportService(ReportService):
                     "report_id": report_id,
                     "source_name": item.get("source_key"),
                     "source_category": category,
+                    "source_role": self._resolve_source_role(item),
                     "title": item.get("title"),
                     "url": item.get("url"),
                     "published_at": item.get("published_at"),
@@ -312,11 +332,27 @@ class AgenticReportService(ReportService):
                     "summary": summary,
                     "has_analysis": bool(analysis),
                     "is_partial": bool(item.get("partial")),
+                    "fulltext_status": self._resolve_fulltext_status(item),
+                    "fulltext_reason": self._resolve_fulltext_reason(item),
+                    "can_deep_read": self._resolve_fulltext_status(item) == "full",
                     "deep_reading_ready": bool(deep_reading),
                     "deep_reading_generated_at": deep_reading.get("generated_at"),
                 }
             )
         return reports
+
+    def list_daily_news(
+        self,
+        source_name: str | None = None,
+        limit: int = 10,
+        source_category: str | None = None,
+    ) -> list[dict[str, str | bool | None]]:
+        return self.list_reports(
+            source_name=source_name,
+            limit=limit,
+            source_category=source_category,
+            source_role="daily_news",
+        )
 
     def get_report_detail(self, report_id: str) -> dict[str, str | bool | None] | None:
         content = self._find_content_by_report_id(report_id)
@@ -333,12 +369,15 @@ class AgenticReportService(ReportService):
             or content.get("summary_text")
             or "暂无概览摘要"
         )
-        can_deep_read = bool(content.get("body_text")) and not bool(content.get("partial"))
+        fulltext_status = self._resolve_fulltext_status(content)
+        fulltext_reason = self._resolve_fulltext_reason(content)
+        can_deep_read = fulltext_status == "full"
         deep_read_block_reason = None if can_deep_read else "当前未获取到完整正文，为避免误导，暂不生成详细解读。"
         return {
             "report_id": report_id,
             "source_name": str(content.get("source_key") or ""),
             "source_category": resolved_category,
+            "source_role": self._resolve_source_role(content),
             "title": str(content.get("title") or ""),
             "url": str(content.get("url") or ""),
             "published_at": content.get("published_at"),
@@ -349,6 +388,8 @@ class AgenticReportService(ReportService):
             "interpreted_summary": analysis.get("interpreted_summary"),
             "has_analysis": bool(analysis),
             "is_partial": bool(content.get("partial")),
+            "fulltext_status": fulltext_status,
+            "fulltext_reason": fulltext_reason,
             "can_deep_read": can_deep_read,
             "deep_read_block_reason": deep_read_block_reason,
             "deep_reading_ready": bool(deep_reading),
@@ -472,9 +513,15 @@ class AgenticReportService(ReportService):
         limit: int,
         formats: list[str],
         source_category: str | None = None,
+        source_role: str | None = None,
     ) -> dict[str, str]:
-        reports = self.list_reports(source_name=source_name, limit=limit, source_category=source_category)
-        title = self._build_summary_title(source_name, source_category)
+        reports = self.list_reports(
+            source_name=source_name,
+            limit=limit,
+            source_category=source_category,
+            source_role=source_role,
+        )
+        title = self._build_summary_title(source_name, source_category, source_role)
         markdown = self._render_report_summary_markdown(title, reports)
         slug = self._build_export_slug({"title": title})
         exported: dict[str, str] = {}
@@ -486,12 +533,17 @@ class AgenticReportService(ReportService):
             exported["pdf"] = str(path)
         return exported
 
-    def _select_sources_for_fetch(self, source_group: str) -> list[ReportSource]:
+    def _select_sources_for_fetch(self, source_group: str, *, source_role: str | None = None) -> list[ReportSource]:
         if source_group == "default":
             defaults = [source for source in self.sources if source.default_enabled]
+            if source_role is not None:
+                defaults = [source for source in defaults if source.source_role == source_role]
             if defaults:
                 return defaults
-        return [source for source in self.sources if source.group == source_group or source.category == source_group]
+        selected = [source for source in self.sources if source.group == source_group or source.category == source_group]
+        if source_role is not None:
+            selected = [source for source in selected if source.source_role == source_role]
+        return selected
 
     def _find_content_by_report_id(self, report_id: str) -> dict[str, Any] | None:
         fingerprint = report_id.removeprefix("report:")
@@ -553,6 +605,29 @@ class AgenticReportService(ReportService):
                 return source.category
         return ""
 
+    def _resolve_source_role(self, content: dict[str, Any]) -> str:
+        metadata = content.get("metadata_json") or {}
+        source_role = metadata.get("source_role")
+        if source_role:
+            return str(source_role)
+        source_name = str(content.get("source_key") or "")
+        for source in self.sources:
+            if source.name == source_name:
+                return source.source_role
+        return "research_report"
+
+    @staticmethod
+    def _resolve_fulltext_status(content: dict[str, Any]) -> str:
+        status = content.get("fulltext_status")
+        if status:
+            return str(status)
+        return "partial" if bool(content.get("partial")) else "full"
+
+    @staticmethod
+    def _resolve_fulltext_reason(content: dict[str, Any]) -> str | None:
+        reason = content.get("fulltext_reason")
+        return str(reason) if reason else None
+
     @staticmethod
     def _build_fingerprint(item: CollectedReportItem) -> str:
         normalized_url = item.metadata_json.get("normalized_url") or ReportSourceCollector.normalize_article_url(item.url)
@@ -561,6 +636,7 @@ class AgenticReportService(ReportService):
     @staticmethod
     def _build_content_record(item: CollectedReportItem, fingerprint: str) -> dict[str, Any]:
         normalized_url = item.metadata_json.get("normalized_url") or ReportSourceCollector.normalize_article_url(item.url)
+        fulltext_status = item.fulltext_status or ("partial" if item.partial else "full")
         return {
             "source_kind": SourceKind.AI_REPORT.value,
             "source_key": item.source_name,
@@ -575,6 +651,8 @@ class AgenticReportService(ReportService):
             "metadata_json": item.metadata_json,
             "dedupe_fingerprint": fingerprint,
             "partial": item.partial,
+            "fulltext_status": fulltext_status,
+            "fulltext_reason": item.fulltext_reason,
         }
 
     @staticmethod
@@ -595,10 +673,14 @@ class AgenticReportService(ReportService):
                 "",
                 "## 报告元信息",
                 f"- 来源: {detail['source_name']}",
+                f"- 类型: {'调查报告' if detail.get('source_role') == 'research_report' else '每日新闻'}",
                 f"- 分类: {detail.get('source_category') or '未分类'}",
                 f"- 发布时间: {detail.get('published_at') or '未知'}",
+                f"- 正文状态: {detail.get('fulltext_status') or '未知'}",
                 f"- 链接: {detail['url']}",
             ]
+            if detail.get("fulltext_reason"):
+                lines.append(f"- 说明: {detail['fulltext_reason']}")
             if detail.get("full_translation_text"):
                 lines.extend(["", "## 全文翻译", str(detail["full_translation_text"]).strip()])
             return "\n".join(lines).strip()
@@ -606,6 +688,8 @@ class AgenticReportService(ReportService):
             f"# {detail['title']}",
             "",
             f"- 来源: {detail['source_name']}",
+            f"- 类型: {'调查报告' if detail.get('source_role') == 'research_report' else '每日新闻'}",
+            f"- 正文状态: {detail.get('fulltext_status') or '未知'}",
             f"- 发布时间: {detail.get('published_at') or '未知'}",
             f"- 链接: {detail['url']}",
             "",
@@ -615,6 +699,8 @@ class AgenticReportService(ReportService):
             "## 解读分析",
             str(detail.get("interpreted_summary") or "暂无"),
         ]
+        if detail.get("fulltext_reason"):
+            lines.extend(["", "## 正文状态说明", str(detail["fulltext_reason"])])
         body_text = detail.get("body_text")
         if body_text:
             lines.extend(["", "## 原文正文", str(body_text)])
@@ -663,7 +749,7 @@ class AgenticReportService(ReportService):
         body_text = str(content.get("body_text") or "")
         if not body_text.strip():
             return True
-        if bool(content.get("partial")):
+        if self._resolve_fulltext_status(content) != "full":
             return True
         if self._looks_like_legacy_truncated_body(body_text):
             return True
@@ -713,12 +799,17 @@ class AgenticReportService(ReportService):
         return f"report-{normalized}"
 
     @staticmethod
-    def _build_summary_title(source_name: str | None, source_category: str | None) -> str:
+    def _build_summary_title(source_name: str | None, source_category: str | None, source_role: str | None) -> str:
+        base = "内容速览"
+        if source_role == "research_report":
+            base = "调查报告速览"
+        elif source_role == "daily_news":
+            base = "每日新闻速览"
         if source_name:
-            return f"{source_name} 报告速览"
+            return f"{source_name} {base}"
         if source_category:
-            return f"{source_category} 报告速览"
-        return "全部来源 报告速览"
+            return f"{source_category} {base}"
+        return f"全部来源 {base}"
 
     @staticmethod
     def _render_report_summary_markdown(

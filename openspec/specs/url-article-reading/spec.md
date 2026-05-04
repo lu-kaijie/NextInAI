@@ -1,4 +1,9 @@
-## ADDED Requirements
+# url-article-reading
+
+## Purpose
+定义单篇文章 URL 导入后的统一阅读、翻译与导出体验。
+
+## Requirements
 
 ### Requirement: 系统 SHALL 支持按单篇 URL 生成文章阅读结果
 系统 MUST 允许用户输入单篇文章 URL，并基于该 URL 生成可阅读的文章结果。阅读结果 MUST 至少包含标题、来源 URL、正文内容、概览摘要，并能够继续进入深度解读和全文翻译流程。
@@ -38,3 +43,11 @@
 - **WHEN** 用户导入一篇原文即为中文的文章
 - **THEN** 系统 MUST 将中文正文直接作为可阅读正文展示
 - **THEN** 系统 MUST NOT 额外生成内容失真的重复翻译
+
+### Requirement: 手动 URL 阅读 SHALL 暴露正文完整性状态
+手动 URL 阅读结果 MUST 向上层暴露正文完整性状态，至少能区分完整正文、部分正文、站点限制和抓取失败。
+
+#### Scenario: 用户查看 URL 导入结果
+- **WHEN** 用户打开一篇通过 URL 导入的文章
+- **THEN** 系统 MUST 能告诉用户正文是否完整
+- **THEN** 若正文不完整，系统 MUST 提供明确状态而不是只显示半截正文

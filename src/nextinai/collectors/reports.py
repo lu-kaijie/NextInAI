@@ -32,6 +32,7 @@ class ReportSource:
     group: str
     kind: str
     url: str
+    source_role: str = "daily_news"
     trusted: bool = True
     category: str = "其他来源"
     default_enabled: bool = True
@@ -50,6 +51,8 @@ class CollectedReportItem:
     body_text: str | None
     metadata_json: dict[str, Any]
     partial: bool
+    fulltext_status: str = ""
+    fulltext_reason: str | None = None
 
 
 class ManualUrlImportError(ValueError):
@@ -67,6 +70,7 @@ DEFAULT_REPORT_SOURCES = [
         "company",
         "feed",
         "https://openai.com/news/rss.xml",
+        source_role="daily_news",
         category="AI 公司",
         description="OpenAI 官方新闻、产品发布与研究更新。",
     ),
@@ -75,6 +79,7 @@ DEFAULT_REPORT_SOURCES = [
         "company",
         "webpage_index",
         "https://www.anthropic.com/news",
+        source_role="daily_news",
         category="AI 公司",
         description="Anthropic 官方新闻与模型、政策动态。",
         article_path_prefix="/news/",
@@ -84,6 +89,7 @@ DEFAULT_REPORT_SOURCES = [
         "company",
         "webpage_index",
         "https://www.anthropic.com/research",
+        source_role="research_report",
         category="AI 公司",
         description="Anthropic 官方研究文章与评测、agent、安全研究内容。",
         article_path_prefix="/research/",
@@ -94,6 +100,7 @@ DEFAULT_REPORT_SOURCES = [
         "company",
         "webpage_index",
         "https://www.anthropic.com/economic-futures",
+        source_role="research_report",
         category="AI 公司",
         description="Anthropic 经济未来栏目，关注 AI 对经济与工作的影响。",
         article_path_prefix="/economic-futures/",
@@ -103,6 +110,7 @@ DEFAULT_REPORT_SOURCES = [
         "company",
         "feed",
         "https://deepmind.google/blog/rss.xml",
+        source_role="daily_news",
         category="AI 公司",
         description="Google DeepMind 官方研究与产品博客。",
     ),
@@ -111,14 +119,28 @@ DEFAULT_REPORT_SOURCES = [
         "company",
         "feed",
         "https://ai.meta.com/blog/rss/",
+        source_role="daily_news",
         category="AI 公司",
         description="Meta AI 官方博客与研究动态。",
+    ),
+    ReportSource(
+        "Meta AI Research",
+        "company",
+        "webpage_index",
+        "https://ai.meta.com/research/",
+        source_role="research_report",
+        category="AI 公司",
+        default_enabled=False,
+        description="Meta AI 官方研究页面，覆盖模型、论文和研究项目。",
+        article_path_prefix="/research/",
+        exclude_path_prefixes=("/research/publications/", "/research/tools/", "/research/models-and-analyses/"),
     ),
     ReportSource(
         "Cohere Blog",
         "company",
         "feed",
         "https://cohere.com/blog/rss.xml",
+        source_role="daily_news",
         category="AI 公司",
         description="Cohere 官方博客与企业 AI 更新。",
     ),
@@ -127,6 +149,7 @@ DEFAULT_REPORT_SOURCES = [
         "company",
         "webpage_index",
         "https://cohere.com/research",
+        source_role="research_report",
         category="AI 公司",
         description="Cohere Research 论文、研究结果与实验性研究内容。",
         article_path_prefix="/research/papers/",
@@ -136,6 +159,7 @@ DEFAULT_REPORT_SOURCES = [
         "open-source",
         "feed",
         "https://huggingface.co/blog/feed.xml",
+        source_role="daily_news",
         category="开源与平台",
         description="Hugging Face 模型、工具链与社区博客。",
     ),
@@ -144,6 +168,7 @@ DEFAULT_REPORT_SOURCES = [
         "open-source",
         "feed",
         "https://blog.langchain.dev/rss/",
+        source_role="daily_news",
         category="开源与平台",
         description="LangChain 官方博客与 agent / framework 更新。",
     ),
@@ -152,14 +177,25 @@ DEFAULT_REPORT_SOURCES = [
         "open-source",
         "feed",
         "https://wandb.ai/site/rss.xml",
+        source_role="daily_news",
         category="开源与平台",
         description="Weights & Biases 平台、实验管理与评测内容。",
+    ),
+    ReportSource(
+        "Hacker News AI",
+        "community",
+        "feed",
+        "https://hnrss.org/newest?q=AI",
+        source_role="daily_news",
+        category="社区与论坛",
+        description="Hacker News 中标题包含 AI 的近期项目与讨论。",
     ),
     ReportSource(
         "LessWrong AI",
         "community",
         "feed",
         "https://www.lesswrong.com/feed.xml?view=curated-rss",
+        source_role="daily_news",
         category="社区与论坛",
         description="LessWrong AI 相关精选文章与讨论。",
     ),
@@ -168,6 +204,7 @@ DEFAULT_REPORT_SOURCES = [
         "community",
         "feed",
         "https://www.latent.space/feed",
+        source_role="daily_news",
         category="社区与论坛",
         description="Latent Space 对 AI 产品、工程与趋势的深度内容。",
     ),
@@ -176,10 +213,20 @@ DEFAULT_REPORT_SOURCES = [
         "community",
         "feed",
         "https://feeds.feedburner.com/simonwillison",
+        source_role="daily_news",
         category="社区与论坛",
         description="Simon Willison 关于 LLM 工程与工具生态的高频更新。",
     ),
 ]
+
+
+@dataclass(slots=True)
+class ArticleFetchResult:
+    title: str | None
+    body_text: str | None
+    published_at: str | None
+    fulltext_status: str
+    fulltext_reason: str | None
 
 
 class ReportSourceCollector:
@@ -262,8 +309,11 @@ class ReportSourceCollector:
                 "original_url": url.strip(),
                 "normalized_url": final_url,
                 "import_kind": "manual_url",
+                "source_role": "research_report",
             },
             partial=article_html is None,
+            fulltext_status="partial" if article_html is None else "full",
+            fulltext_reason="页面可访问，但未识别到明确的 article/main 结构，正文完整性可能受影响。" if article_html is None else None,
         )
 
     @staticmethod
@@ -293,25 +343,13 @@ class ReportSourceCollector:
             )
         )
 
-    def fetch_article_body(self, url: str) -> str | None:
+    def fetch_article_body(self, url: str) -> ArticleFetchResult:
         response = self.client.get(url, timeout=self.article_timeout)
-        if response.status_code >= 400:
-            return None
-        text = self._extract_body_text(response.text)
-        return text[:BODY_TEXT_LIMIT] if text else None
+        return self._build_article_fetch_result(response.text, response.status_code)
 
-    def fetch_article_details(self, url: str) -> tuple[str | None, str | None, str | None]:
+    def fetch_article_details(self, url: str) -> ArticleFetchResult:
         response = self.client.get(url, timeout=self.article_timeout)
-        if response.status_code >= 400:
-            return None, None, None
-        title = self._extract_html_title(response.text)
-        article_html = self._extract_article_html(response.text)
-        text = self._extract_body_text(response.text, article_html=article_html)
-        summary = self._extract_meta_description(response.text)
-        if summary and text:
-            text = f"{summary} {text}"
-        published_at = self._extract_html_publish_date(article_html or response.text)
-        return title, text[:BODY_TEXT_LIMIT] if text else None, published_at
+        return self._build_article_fetch_result(response.text, response.status_code)
 
     def _parse_feed(self, source: ReportSource, xml_text: str, progress_callback=None) -> list[CollectedReportItem]:
         root = ElementTree.fromstring(xml_text)
@@ -328,14 +366,21 @@ class ReportSourceCollector:
             summary = self._find_text(entry, ["description", "summary", "content"])
             body_text = None
             partial = True
+            fulltext_status = "partial"
+            fulltext_reason = "正文抓取未完成，当前使用摘要或索引信息降级展示。"
             try:
-                body_text = self.fetch_article_body(url)
-                partial = not bool(body_text)
+                article = self.fetch_article_body(url)
+                body_text = article.body_text
+                partial = article.fulltext_status != "full"
+                fulltext_status = article.fulltext_status
+                fulltext_reason = article.fulltext_reason
                 if progress_callback is not None:
                     status = "正文已抓取" if body_text else "正文为空，使用摘要降级"
                     progress_callback(f"[{source.name}] 第 {index}/{total} 篇完成：{status}")
             except Exception as exc:
                 partial = True
+                fulltext_status = "failed"
+                fulltext_reason = f"正文抓取失败：{exc}"
                 if progress_callback is not None:
                     progress_callback(f"[{source.name}] 第 {index}/{total} 篇跳过正文抓取：{exc}")
             items.append(
@@ -352,8 +397,11 @@ class ReportSourceCollector:
                         "category": source.category,
                         "default_enabled": source.default_enabled,
                         "description": source.description,
+                        "source_role": source.source_role,
                     },
                     partial=partial,
+                    fulltext_status=fulltext_status,
+                    fulltext_reason=fulltext_reason,
                 )
             )
         return items
@@ -367,9 +415,10 @@ class ReportSourceCollector:
             title_hint = slug.title() or "Untitled report"
             if progress_callback is not None:
                 progress_callback(f"[{source.name}] 正在抓取第 {index}/{total} 篇：{title_hint}")
-            page_title, body_text, published_at = self.fetch_article_details(article_url)
-            clean_title = (page_title or title_hint).replace("\\", "").strip()
-            partial = not bool(body_text)
+            article = self.fetch_article_details(article_url)
+            clean_title = (article.title or title_hint).replace("\\", "").strip()
+            body_text = article.body_text
+            partial = article.fulltext_status != "full"
             if progress_callback is not None:
                 status = "正文已抓取" if body_text else "正文为空，使用标题降级"
                 progress_callback(f"[{source.name}] 第 {index}/{total} 篇完成：{status}")
@@ -378,7 +427,7 @@ class ReportSourceCollector:
                     source_name=source.name,
                     title=clean_title,
                     url=article_url,
-                    published_at=published_at,
+                    published_at=article.published_at,
                     summary_text=body_text[:320] if body_text else clean_title,
                     body_text=self._clean_text(body_text),
                     metadata_json={
@@ -387,11 +436,62 @@ class ReportSourceCollector:
                         "category": source.category,
                         "default_enabled": source.default_enabled,
                         "description": source.description,
+                        "source_role": source.source_role,
                     },
                     partial=partial,
+                    fulltext_status=article.fulltext_status,
+                    fulltext_reason=article.fulltext_reason,
                 )
             )
         return items
+
+    def _build_article_fetch_result(self, html_text: str, status_code: int) -> ArticleFetchResult:
+        if status_code in {401, 403}:
+            return ArticleFetchResult(
+                title=self._extract_html_title(html_text),
+                body_text=None,
+                published_at=None,
+                fulltext_status="restricted",
+                fulltext_reason=f"站点拒绝访问正文：HTTP {status_code}",
+            )
+        if status_code == 404:
+            return ArticleFetchResult(
+                title=self._extract_html_title(html_text),
+                body_text=None,
+                published_at=None,
+                fulltext_status="failed",
+                fulltext_reason="文章页面不存在或已被移除。",
+            )
+        if status_code >= 400:
+            return ArticleFetchResult(
+                title=self._extract_html_title(html_text),
+                body_text=None,
+                published_at=None,
+                fulltext_status="failed",
+                fulltext_reason=f"正文抓取失败：HTTP {status_code}",
+            )
+        title = self._extract_html_title(html_text)
+        article_html = self._extract_article_html(html_text)
+        text = self._extract_body_text(html_text, article_html=article_html)
+        summary = self._extract_meta_description(html_text)
+        if summary and text:
+            text = f"{summary} {text}"
+        published_at = self._extract_html_publish_date(article_html or html_text)
+        if text:
+            return ArticleFetchResult(
+                title=title,
+                body_text=text[:BODY_TEXT_LIMIT],
+                published_at=published_at,
+                fulltext_status="full" if article_html else "partial",
+                fulltext_reason=None if article_html else "页面可访问，但未识别到明确的 article/main 结构，正文完整性可能受影响。",
+            )
+        return ArticleFetchResult(
+            title=title,
+            body_text=None,
+            published_at=published_at,
+            fulltext_status="partial",
+            fulltext_reason="页面可访问，但未提取到有效正文。",
+        )
 
     @staticmethod
     def _iter_feed_entries(root: ElementTree.Element) -> list[ElementTree.Element]:

@@ -125,9 +125,13 @@ class UnifiedCapabilityService(CapabilityService):
         log_event(self.logger, "导出热门榜", window=window, limit=limit, formats=",".join(formats))
         return self.trending_service.export_trending(window, limit, formats)
 
-    def fetch_reports(self, source_group: str, progress_callback=None) -> str:
-        log_event(self.logger, "抓取报告来源组", source_group=source_group)
-        return self.report_service.fetch_reports(source_group, progress_callback=progress_callback)
+    def fetch_reports(self, source_group: str, progress_callback=None, source_role: str | None = None) -> str:
+        log_event(self.logger, "抓取报告来源组", source_group=source_group, source_role=source_role)
+        return self.report_service.fetch_reports(
+            source_group,
+            progress_callback=progress_callback,
+            source_role=source_role,
+        )
 
     def import_report_url(self, url: str, progress_callback=None) -> dict[str, str | bool | None]:
         log_event(self.logger, "导入单篇报告 URL", url=url)
@@ -137,16 +141,31 @@ class UnifiedCapabilityService(CapabilityService):
         self,
         source_group: str | None = None,
         source_category: str | None = None,
+        source_role: str | None = None,
     ) -> list[dict[str, str | int | bool | None]]:
-        return self.report_service.list_sources(source_group, source_category)
+        return self.report_service.list_sources(source_group, source_category, source_role)
 
     def list_reports(
         self,
         source_name: str | None = None,
         limit: int = 10,
         source_category: str | None = None,
+        source_role: str | None = None,
     ) -> list[dict[str, str | bool | None]]:
         return self.report_service.list_reports(
+            source_name=source_name,
+            limit=limit,
+            source_category=source_category,
+            source_role=source_role,
+        )
+
+    def list_daily_news(
+        self,
+        source_name: str | None = None,
+        limit: int = 10,
+        source_category: str | None = None,
+    ) -> list[dict[str, str | bool | None]]:
+        return self.report_service.list_daily_news(
             source_name=source_name,
             limit=limit,
             source_category=source_category,
@@ -177,12 +196,14 @@ class UnifiedCapabilityService(CapabilityService):
         limit: int,
         formats: list[str],
         source_category: str | None = None,
+        source_role: str | None = None,
     ) -> dict[str, str]:
         log_event(
             self.logger,
             "导出报告摘要",
             source_name=source_name,
             source_category=source_category,
+            source_role=source_role,
             limit=limit,
             formats=",".join(formats),
         )
@@ -191,6 +212,7 @@ class UnifiedCapabilityService(CapabilityService):
             limit,
             formats,
             source_category=source_category,
+            source_role=source_role,
         )
 
     def generate_digest(self, scope: str) -> str:
