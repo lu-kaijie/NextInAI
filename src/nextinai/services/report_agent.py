@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from typing import Any
 
@@ -139,6 +139,7 @@ class AgenticReportService(ReportService):
                         "analysis_kind": AnalysisKind.REPORT_INTERPRETATION.value,
                         "source_ref": source_ref,
                         "title": item.title,
+                        "headline_summary": interpretation.headline_summary,
                         "factual_summary": interpretation.factual_summary,
                         "interpreted_summary": interpretation.interpreted_summary,
                         "evidence_json": interpretation.evidence,
@@ -311,21 +312,18 @@ class AgenticReportService(ReportService):
             report_id = f"report:{item['dedupe_fingerprint']}"
             analysis = analysis_index.get(report_id) or {}
             deep_reading = deep_reading_index.get(report_id) or {}
-            summary = (
-                analysis.get("interpreted_summary")
-                or analysis.get("factual_summary")
-                or item.get("summary_text")
-                or "暂无概览摘要"
-            )
+            resolved_source_role = self._resolve_source_role(item)
+            summary = self._build_overview_summary(resolved_source_role, analysis, item)
             reports.append(
                 {
                     "report_id": report_id,
                     "source_name": item.get("source_key"),
                     "source_category": category,
-                    "source_role": self._resolve_source_role(item),
+                    "source_role": resolved_source_role,
                     "title": item.get("title"),
                     "url": item.get("url"),
                     "published_at": item.get("published_at"),
+                    "headline_summary": analysis.get("headline_summary"),
                     "overview_summary": summary,
                     "factual_summary": analysis.get("factual_summary"),
                     "interpreted_summary": analysis.get("interpreted_summary"),
@@ -346,13 +344,16 @@ class AgenticReportService(ReportService):
         source_name: str | None = None,
         limit: int = 10,
         source_category: str | None = None,
+        window: str = "daily",
     ) -> list[dict[str, str | bool | None]]:
-        return self.list_reports(
+        rows = self.list_reports(
             source_name=source_name,
-            limit=limit,
+            limit=max(limit, 200),
             source_category=source_category,
             source_role="daily_news",
         )
+        filtered = [row for row in rows if self._matches_news_window(str(row.get("published_at") or ""), window)]
+        return filtered[:limit]
 
     def get_report_detail(self, report_id: str) -> dict[str, str | bool | None] | None:
         content = self._find_content_by_report_id(report_id)
@@ -363,12 +364,8 @@ class AgenticReportService(ReportService):
         excerpt_translation = self._find_excerpt_translation(report_id) or {}
         metadata = content.get("metadata_json") or {}
         resolved_category = self._resolve_source_category(content)
-        overview_summary = (
-            analysis.get("interpreted_summary")
-            or analysis.get("factual_summary")
-            or content.get("summary_text")
-            or "暂无概览摘要"
-        )
+        resolved_source_role = self._resolve_source_role(content)
+        overview_summary = self._build_overview_summary(resolved_source_role, analysis, content)
         fulltext_status = self._resolve_fulltext_status(content)
         fulltext_reason = self._resolve_fulltext_reason(content)
         can_deep_read = fulltext_status == "full"
@@ -377,10 +374,11 @@ class AgenticReportService(ReportService):
             "report_id": report_id,
             "source_name": str(content.get("source_key") or ""),
             "source_category": resolved_category,
-            "source_role": self._resolve_source_role(content),
+            "source_role": resolved_source_role,
             "title": str(content.get("title") or ""),
             "url": str(content.get("url") or ""),
             "published_at": content.get("published_at"),
+            "headline_summary": analysis.get("headline_summary"),
             "summary_text": content.get("summary_text"),
             "body_text": content.get("body_text"),
             "overview_summary": overview_summary,
@@ -540,7 +538,11 @@ class AgenticReportService(ReportService):
                 defaults = [source for source in defaults if source.source_role == source_role]
             if defaults:
                 return defaults
-        selected = [source for source in self.sources if source.group == source_group or source.category == source_group]
+        selected = [
+            source
+            for source in self.sources
+            if source.name == source_group or source.group == source_group or source.category == source_group
+        ]
         if source_role is not None:
             selected = [source for source in selected if source.source_role == source_role]
         return selected
@@ -615,6 +617,63 @@ class AgenticReportService(ReportService):
             if source.name == source_name:
                 return source.source_role
         return "research_report"
+
+    @staticmethod
+    def _build_overview_summary(
+        source_role: str,
+        analysis: dict[str, Any],
+        content: dict[str, Any],
+    ) -> str:
+        if source_role == "daily_news":
+            return str(
+                analysis.get("factual_summary")
+                or content.get("summary_text")
+                or analysis.get("interpreted_summary")
+                or "暂无概览摘要"
+            )
+        return str(
+            analysis.get("interpreted_summary")
+            or analysis.get("factual_summary")
+            or content.get("summary_text")
+            or "暂无概览摘要"
+        )
+
+    @staticmethod
+    def _matches_news_window(published_at: str, window: str) -> bool:
+        parsed = AgenticReportService._parse_report_datetime(published_at)
+        if parsed is None:
+            return window != "daily"
+        now = datetime.now(timezone.utc)
+        normalized = window.strip().lower()
+        if normalized == "daily":
+            return parsed.astimezone(timezone.utc).date() == now.date()
+        if normalized == "7d":
+            return parsed >= now - timedelta(days=7)
+        if normalized == "30d":
+            return parsed >= now - timedelta(days=30)
+        return True
+
+    @staticmethod
+    def _parse_report_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            return None
+        parsed_rfc = ReportSourceCollector.parse_published_at(candidate)
+        if isinstance(parsed_rfc, datetime):
+            return parsed_rfc if parsed_rfc.tzinfo is not None else parsed_rfc.replace(tzinfo=timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d", "%b %d, %Y", "%B %d, %Y"):
+            try:
+                return datetime.strptime(candidate, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        return None
 
     @staticmethod
     def _resolve_fulltext_status(content: dict[str, Any]) -> str:
@@ -722,6 +781,7 @@ class AgenticReportService(ReportService):
                 "analysis_kind": AnalysisKind.REPORT_INTERPRETATION.value,
                 "source_ref": report_id,
                 "title": content.get("title"),
+                "headline_summary": interpretation.headline_summary,
                 "factual_summary": interpretation.factual_summary,
                 "interpreted_summary": interpretation.interpreted_summary,
                 "evidence_json": interpretation.evidence,

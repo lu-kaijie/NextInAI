@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from dataclasses import asdict
+import re
 from typing import Any
 
 import streamlit as st
@@ -54,6 +55,10 @@ def _ensure_state() -> None:
         st.session_state.selected_news_category = "全部分类"
     if "daily_news_auto_loaded" not in st.session_state:
         st.session_state.daily_news_auto_loaded = False
+    if "selected_news_window" not in st.session_state:
+        st.session_state.selected_news_window = "daily"
+    if "expanded_news_ids" not in st.session_state:
+        st.session_state.expanded_news_ids = set()
 
 
 def _append_runtime_log(message: str) -> None:
@@ -78,6 +83,43 @@ def _render_body_text(body_text: str) -> None:
         return
     for paragraph in paragraphs:
         st.markdown(paragraph)
+
+
+def _toggle_news_expanded(report_id: str) -> None:
+    expanded = set(st.session_state.expanded_news_ids)
+    if report_id in expanded:
+        expanded.remove(report_id)
+    else:
+        expanded.add(report_id)
+    st.session_state.expanded_news_ids = expanded
+
+
+def _build_news_summary_line(item: dict[str, object]) -> str:
+    headline = str(item.get("headline_summary") or "").strip()
+    title = str(item.get("title") or "").strip()
+    factual = str(item.get("factual_summary") or item.get("overview_summary") or item.get("summary") or "").strip()
+    normalized_title = re.sub(r"^(Ask HN:|Show HN:)\s*", "", title, flags=re.I).strip(" \"'“”")
+    normalized_title = re.sub(r"\s+", " ", normalized_title).strip()
+
+    if headline:
+        compact_headline = re.sub(r"\s+", " ", headline).strip(" \"'“”")
+        if compact_headline and compact_headline.lower() != normalized_title.lower():
+            return compact_headline if len(compact_headline) <= 72 else f"{compact_headline[:72].rstrip()}..."
+
+    compact = " ".join(factual.split())
+    compact = re.sub(r"^事实[摘要总结]*[:：]\s*", "", compact)
+    compact = re.sub(r"^[^。]*发布了《[^》]+》。已提取事实摘要[:：]?\s*", "", compact)
+    compact = re.sub(r"^这是一条[^，。,]*[，,]\s*", "", compact)
+    compact = re.sub(r"^一则[^，。,]*帖子[^，。,]*[，,]\s*", "", compact)
+    compact = re.sub(r"^一篇[^，。,]*文章[^，。,]*[，,]\s*", "", compact)
+    compact = re.sub(r"^(从\s*NextInAI\s*agent\s*的角度看，这条更新|这值得\s*AI/?agent\s*用户关注，因为|这值得关注，因为)\s*", "", compact)
+    compact = compact.replace("当前基于已抓取正文。", "").replace("当前仅基于部分内容。", "").strip(" 。；;，,")
+    if compact:
+        return compact if len(compact) <= 72 else f"{compact[:72].rstrip()}..."
+
+    if normalized_title:
+        return normalized_title if len(normalized_title) <= 72 else f"{normalized_title[:72].rstrip()}..."
+    return "暂无总结"
 
 
 def _open_report_detail_page(report_id: str, auto_generate: bool = False) -> None:
@@ -649,7 +691,7 @@ def _render_daily_news_tab(capability_service, storage: FileStorage) -> None:
             _append_runtime_log(f"[daily-news] 自动抓取失败：{exc}")
             st.warning(f"自动抓取每日新闻失败：{exc}")
 
-    news_action_cols = st.columns([1, 1])
+    news_action_cols = st.columns([1, 1, 1])
     with news_action_cols[0]:
         if st.button("抓取默认新闻来源", use_container_width=True):
             st.session_state.daily_news_progress = []
@@ -662,6 +704,27 @@ def _render_daily_news_tab(capability_service, storage: FileStorage) -> None:
                 _append_runtime_log(f"[daily-news] 抓取失败：{exc}")
                 st.error(str(exc))
     with news_action_cols[1]:
+        selector = None
+        if st.session_state.selected_news_source != "全部来源":
+            selector = st.session_state.selected_news_source
+        elif st.session_state.selected_news_category != "全部分类":
+            selector = st.session_state.selected_news_category
+        button_label = "抓取当前筛选来源" if selector else "抓取当前筛选来源"
+        if st.button(button_label, use_container_width=True, disabled=not bool(selector)):
+            st.session_state.daily_news_progress = []
+            try:
+                _append_runtime_log(f"[daily-news] 抓取当前筛选来源：{selector}")
+                result = capability_service.fetch_reports(
+                    str(selector),
+                    progress_callback=_progress,
+                    source_role="daily_news",
+                )
+                _append_runtime_log(f"[daily-news] 抓取完成：{result}")
+                st.success(result)
+            except Exception as exc:
+                _append_runtime_log(f"[daily-news] 抓取失败：{exc}")
+                st.error(str(exc))
+    with news_action_cols[2]:
         if st.button("刷新新闻列表", use_container_width=True):
             st.rerun()
 
@@ -670,18 +733,26 @@ def _render_daily_news_tab(capability_service, storage: FileStorage) -> None:
             st.code("\n".join(st.session_state.daily_news_progress))
 
     source_rows = capability_service.list_report_sources(source_role="daily_news")
-    filter_cols = st.columns([1, 1, 1])
+    filter_cols = st.columns([1, 1, 1, 1])
     with filter_cols[0]:
+        window_options = {"daily": "当天", "7d": "最近 7 天", "30d": "最近 30 天"}
+        selected_window = st.selectbox(
+            "时间范围",
+            list(window_options.keys()),
+            key="selected_news_window",
+            format_func=lambda value: window_options[value],
+        )
+    with filter_cols[1]:
         category_options = build_source_category_options(source_rows)
         if st.session_state.selected_news_category not in category_options:
             st.session_state.selected_news_category = category_options[0]
         selected_category = st.selectbox("按分类筛选", category_options, key="selected_news_category")
-    with filter_cols[1]:
+    with filter_cols[2]:
         source_options = build_source_name_options(source_rows, selected_category)
         if st.session_state.selected_news_source not in source_options:
             st.session_state.selected_news_source = source_options[0]
         selected_source = st.selectbox("按来源筛选", source_options, key="selected_news_source")
-    with filter_cols[2]:
+    with filter_cols[3]:
         news_limit = st.slider("展示数量", min_value=6, max_value=24, value=12, step=3, key="daily-news-limit")
 
     active_source = None if selected_source == "全部来源" else selected_source
@@ -690,6 +761,7 @@ def _render_daily_news_tab(capability_service, storage: FileStorage) -> None:
         source_name=active_source,
         limit=int(news_limit),
         source_category=active_category,
+        window=selected_window,
     )
 
     st.markdown("### 最近新闻")
@@ -719,35 +791,50 @@ def _render_daily_news_tab(capability_service, storage: FileStorage) -> None:
                 _append_runtime_log(f"[daily-news] 已导出新闻摘要 PDF：{active_source or active_category or '全部来源'}")
                 st.success("新闻摘要 PDF 导出完成")
                 st.json(exported)
-        for row_index, news_row in enumerate(chunk_reports(news_rows, columns=2)):
-            columns = st.columns(2)
-            for col_index, item in enumerate(news_row):
-                with columns[col_index]:
-                    with st.container(border=True):
-                        st.markdown(f"#### {item['title']}")
-                        st.caption(
-                            f"{item['source_name']} | {item.get('source_category') or '未分类'} | "
-                            f"{item.get('published_at') or '未知时间'}"
-                        )
-                        st.write(item.get("overview_summary") or "暂无总结")
-                        status = _fulltext_status_label(str(item.get("fulltext_status") or ""))
-                        st.caption(f"正文状态：{status}")
-                        if item.get("fulltext_reason"):
-                            st.info(str(item.get("fulltext_reason")))
-                        action_cols = st.columns(3)
-                        report_id = str(item["report_id"])
-                        with action_cols[0]:
-                            if st.button("打开阅读页", key=f"news-open-{row_index}-{col_index}", use_container_width=True):
-                                _append_runtime_log(f"[daily-news] 打开新闻阅读页：{report_id}")
-                                _open_report_detail_page(report_id, auto_generate=False)
-                        with action_cols[1]:
-                            if st.button("生成详细解读", key=f"news-deep-{row_index}-{col_index}", use_container_width=True):
-                                _append_runtime_log(f"[daily-news] 打开新闻阅读页并尝试深读：{report_id}")
-                                _open_report_detail_page(report_id, auto_generate=True)
-                        with action_cols[2]:
-                            st.link_button("原文链接", str(item["url"]), use_container_width=True)
+        expanded_ids = set(st.session_state.expanded_news_ids)
+        for index, item in enumerate(news_rows):
+            report_id = str(item["report_id"])
+            is_expanded = report_id in expanded_ids
+            with st.container(border=True):
+                st.markdown(f"### {_build_news_summary_line(item)}")
+                st.markdown(str(item["title"]))
+                tags = [
+                    str(item["source_name"]),
+                    str(item.get("source_category") or "未分类"),
+                ]
+                if item.get("published_at"):
+                    tags.append(str(item["published_at"]))
+                st.caption(" / ".join(tags))
+
+                header_cols = st.columns([1, 1, 1])
+                with header_cols[0]:
+                    if st.button("收起" if is_expanded else "展开", key=f"news-toggle-{index}", use_container_width=True):
+                        _toggle_news_expanded(report_id)
+                        st.rerun()
+                with header_cols[1]:
+                    if st.button("阅读页", key=f"news-open-{index}", use_container_width=True):
+                        _append_runtime_log(f"[daily-news] 打开新闻阅读页：{report_id}")
+                        _open_report_detail_page(report_id, auto_generate=False)
+                with header_cols[2]:
+                    st.link_button("原文", str(item["url"]), use_container_width=True)
+
+                if is_expanded:
+                    st.divider()
+                    st.write(item.get("overview_summary") or "暂无总结")
+                    st.write(f"事实摘要：{item.get('factual_summary') or '暂无'}")
+                    st.write(f"概览解读：{item.get('interpreted_summary') or '暂无'}")
+                    status = _fulltext_status_label(str(item.get("fulltext_status") or ""))
+                    st.caption(f"正文状态：{status}")
+                    if item.get("fulltext_reason"):
+                        st.info(str(item.get("fulltext_reason")))
+                    if item.get("can_deep_read"):
+                        if st.button("生成详细解读", key=f"news-deep-{index}", use_container_width=True):
+                            _append_runtime_log(f"[daily-news] 打开新闻阅读页并尝试深读：{report_id}")
+                            _open_report_detail_page(report_id, auto_generate=True)
+                    else:
+                        st.caption("当前正文不完整或受限，详细解读不可用。")
     else:
-        st.info("当前还没有可展示的每日新闻。")
+        st.info("当前时间范围下还没有可展示的每日新闻。")
 
     with st.expander("新闻来源", expanded=False):
         if source_rows:

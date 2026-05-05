@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from nextinai.agents import DeepReportReading, ReportInterpretation, TrendingProjectAnalysis
 from nextinai.collectors.reports import CollectedReportItem, ManualUrlImportError, ReportSource
 from nextinai.services.report_agent import AgenticReportService
@@ -56,6 +58,7 @@ class FakeInterpreter:
 
     def interpret_report(self, *, title, source_name, url, summary_text, body_text):
         return ReportInterpretation(
+            headline_summary=title,
             factual_summary=f"事实：{title}",
             interpreted_summary=f"解读：{source_name}",
             evidence=[url],
@@ -322,6 +325,7 @@ def test_report_service_lists_sources_reports_and_detail(tmp_path) -> None:
                 "analysis_kind": "report_interpretation",
                 "source_ref": f"report:{fingerprint}",
                 "title": report.title,
+                "headline_summary": "一句话标题",
                 "factual_summary": "事实：Agent roadmap update",
                 "interpreted_summary": "解读：OpenAI News",
                 "evidence_json": [],
@@ -339,6 +343,7 @@ def test_report_service_lists_sources_reports_and_detail(tmp_path) -> None:
     assert reports[0]["title"] == "Agent roadmap update"
     assert reports[0]["deep_reading_ready"] is False
     assert reports[0]["fulltext_status"] == "full"
+    assert reports[0]["headline_summary"] == "一句话标题"
     assert detail is not None
     assert detail["interpreted_summary"] == "解读：OpenAI News"
     assert detail["source_role"] == "daily_news"
@@ -370,7 +375,7 @@ def test_report_service_filters_research_reports_and_daily_news(tmp_path) -> Non
         source_name="OpenAI News",
         title="OpenAI launches update",
         url="https://example.com/news/update",
-        published_at="2026-05-02",
+        published_at=datetime.now(timezone.utc).date().isoformat(),
         summary_text="news summary",
         body_text="news body",
         metadata_json={"group": "default", "category": "AI 公司", "source_role": "daily_news"},
@@ -395,8 +400,74 @@ def test_report_service_filters_research_reports_and_daily_news(tmp_path) -> Non
     assert research_rows[0]["title"] == "Project Vend 2"
     assert len(news_rows) == 1
     assert news_rows[0]["title"] == "OpenAI launches update"
+    assert news_rows[0]["overview_summary"] == "news summary"
     assert len(source_rows) == 1
     assert source_rows[0]["source_name"] == "Anthropic Research"
+
+
+def test_report_service_daily_news_accepts_rfc2822_published_at(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    service = AgenticReportService(
+        storage=storage,
+        collector=FakeReportCollector([]),
+        agent=FakeInterpreter(),
+        sources=[
+            ReportSource("Hacker News AI", "community", "feed", "https://example.com/hn.xml", source_role="daily_news", category="社区与论坛"),
+        ],
+    )
+    today = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+    item = CollectedReportItem(
+        source_name="Hacker News AI",
+        title="HN item",
+        url="https://example.com/hn-item",
+        published_at=today,
+        summary_text="hn summary",
+        body_text="hn body",
+        metadata_json={"group": "community", "category": "社区与论坛", "source_role": "daily_news"},
+        partial=False,
+        fulltext_status="full",
+    )
+    fingerprint = service._build_fingerprint(item)
+    storage.save_collection("content_items", [service._build_content_record(item, fingerprint)])
+
+    rows = service.list_daily_news(limit=10, window="daily")
+
+    assert len(rows) == 1
+    assert rows[0]["title"] == "HN item"
+
+
+def test_report_service_can_fetch_exact_source_name(tmp_path) -> None:
+    storage = FileStorage(tmp_path)
+    collector = FakeAnthropicCollector()
+    service = AgenticReportService(
+        storage=storage,
+        collector=collector,
+        agent=FakeInterpreter(),
+        sources=[
+            ReportSource("Reddit Artificial", "community", "feed", "https://example.com/reddit.xml", source_role="daily_news", category="社区与论坛"),
+            ReportSource("OpenAI News", "default", "feed", "https://example.com/openai.xml", source_role="daily_news", category="AI 公司"),
+        ],
+    )
+
+    service.fetch_reports("Reddit Artificial", source_role="daily_news")
+
+    assert collector.calls == [("Reddit Artificial", "feed", "https://example.com/reddit.xml")]
+
+
+def test_rule_based_interpreter_generates_clean_headline_summary() -> None:
+    from nextinai.agents.intelligence import RuleBasedIntelligenceAgent
+
+    agent = RuleBasedIntelligenceAgent()
+
+    interpretation = agent.interpret_report(
+        title="Ask HN: Do you feel reading AI generated readme tiring?",
+        source_name="Hacker News AI",
+        url="https://example.com/item",
+        summary_text="一则 Hacker News 的 Ask HN 帖子提问“你是否觉得阅读 AI 生成的 README 很累”，正文表示作者对反复出现的固定写作结构感到厌倦。",
+        body_text=None,
+    )
+
+    assert interpretation.headline_summary == "Do you feel reading AI generated readme tiring?"
 
 
 def test_report_service_can_export_report_detail(tmp_path) -> None:

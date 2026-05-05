@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from html import unescape
 import re
 from typing import Any
@@ -189,6 +190,26 @@ DEFAULT_REPORT_SOURCES = [
         source_role="daily_news",
         category="社区与论坛",
         description="Hacker News 中标题包含 AI 的近期项目与讨论。",
+    ),
+    ReportSource(
+        "Reddit Artificial",
+        "community",
+        "feed",
+        "https://www.reddit.com/r/artificial/.rss",
+        source_role="daily_news",
+        category="社区与论坛",
+        default_enabled=False,
+        description="Reddit r/artificial 社区关于 AI 产品、模型和行业新闻的讨论流。",
+    ),
+    ReportSource(
+        "Product Hunt",
+        "community",
+        "feed",
+        "https://www.producthunt.com/feed",
+        source_role="daily_news",
+        category="社区与论坛",
+        default_enabled=False,
+        description="Product Hunt 新品发布流，可用于补充新工具和 AI 产品动态。",
     ),
     ReportSource(
         "LessWrong AI",
@@ -510,6 +531,9 @@ class ReportSourceCollector:
             atom_value = entry.findtext(f"{{http://www.w3.org/2005/Atom}}{tag}")
             if atom_value:
                 return atom_value
+            namespaced = entry.findtext(f".//{{*}}{tag}")
+            if namespaced:
+                return namespaced
         return None
 
     @staticmethod
@@ -655,6 +679,18 @@ class ReportSourceCollector:
     def _extract_html_publish_date(html_text: str) -> str | None:
         match = re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}\b", html_text)
         return match.group(0) if match else None
+
+    @staticmethod
+    def parse_published_at(value: str | None) -> Any | None:
+        if not value:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            return parsedate_to_datetime(candidate)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
 
     def _clean_text(self, value: str | None) -> str | None:
         if not value:

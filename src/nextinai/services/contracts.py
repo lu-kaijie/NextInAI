@@ -81,6 +81,7 @@ class ReportService:
         source_name: str | None = None,
         limit: int = 10,
         source_category: str | None = None,
+        window: str = "daily",
     ) -> list[dict[str, str | bool | None]]:
         raise NotImplementedError
 
@@ -225,6 +226,7 @@ class CapabilityService:
         source_name: str | None = None,
         limit: int = 10,
         source_category: str | None = None,
+        window: str = "daily",
     ) -> list[dict[str, str | bool | None]]:
         raise NotImplementedError
 

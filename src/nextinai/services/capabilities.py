@@ -164,11 +164,13 @@ class UnifiedCapabilityService(CapabilityService):
         source_name: str | None = None,
         limit: int = 10,
         source_category: str | None = None,
+        window: str = "daily",
     ) -> list[dict[str, str | bool | None]]:
         return self.report_service.list_daily_news(
             source_name=source_name,
             limit=limit,
             source_category=source_category,
+            window=window,
         )
 
     def get_report_detail(self, report_id: str) -> dict[str, str | bool | None] | None:

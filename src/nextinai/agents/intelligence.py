@@ -14,6 +14,7 @@ from nextinai.collectors.trending import TrendingRepository
 
 @dataclass(slots=True)
 class ReportInterpretation:
+    headline_summary: str
     factual_summary: str
     interpreted_summary: str
     evidence: list[str]
@@ -143,11 +144,13 @@ class RuleBasedIntelligenceAgent(IntelligenceAgent):
         content = (body_text or summary_text or "").strip()
         partial = not bool(body_text and body_text.strip())
         facts = self._build_factual_summary(title, source_name, summary_text, content, partial)
+        headline = self._build_headline_summary(title, facts)
         interpretation = self._build_report_interpretation(title, source_name, content, partial)
         evidence = [url]
         if summary_text:
             evidence.append(summary_text[:160])
         return ReportInterpretation(
+            headline_summary=headline,
             factual_summary=facts,
             interpreted_summary=interpretation,
             evidence=evidence,
@@ -391,9 +394,22 @@ class RuleBasedIntelligenceAgent(IntelligenceAgent):
         title: str, source_name: str, summary_text: str | None, content: str, partial: bool
     ) -> str:
         excerpt = (summary_text or content or "未能提取到足够正文").strip().replace("\n", " ")
-        excerpt = excerpt[:240]
-        suffix = "当前仅基于部分内容。" if partial else "当前基于已抓取正文。"
-        return f"{source_name} 发布了《{title}》。已提取事实摘要：{excerpt}。{suffix}"
+        excerpt = re.sub(r"\s+", " ", excerpt)
+        excerpt = excerpt[:120].strip(" 。；;，,")
+        if not excerpt:
+            excerpt = title
+        suffix = " 当前仅基于部分内容。" if partial else ""
+        return f"{excerpt}。{suffix}".strip()
+
+    @staticmethod
+    def _build_headline_summary(title: str, factual_summary: str) -> str:
+        normalized_title = re.sub(r"^(Ask HN:|Show HN:)\s*", "", title, flags=re.I).strip(" \"'“”")
+        normalized_title = re.sub(r"\s+", " ", normalized_title).strip()
+        if normalized_title:
+            return normalized_title
+        compact = re.sub(r"\s+", " ", factual_summary).strip(" 。；;，,")
+        compact = compact.replace("当前仅基于部分内容。", "").strip(" 。；;，,")
+        return compact or "暂无总结"
 
     @staticmethod
     def _build_report_interpretation(title: str, source_name: str, content: str, partial: bool) -> str:
@@ -410,7 +426,7 @@ class RuleBasedIntelligenceAgent(IntelligenceAgent):
         if not themes:
             themes.append("更像一则需要持续跟踪的产品/研究动态")
         partial_suffix = "由于正文不完整，这部分判断需要后续复核。" if partial else ""
-        return f"从 NextInAI agent 的角度看，这条更新 {source_name} { '；'.join(themes) }。{partial_suffix}".strip()
+        return f"{source_name} 这条内容 {'；'.join(themes)}。{partial_suffix}".strip()
 
     @staticmethod
     def _segment_report_content(content: str) -> list[str]:
@@ -566,9 +582,12 @@ class OpenAIIntelligenceAgent(IntelligenceAgent):
             )
         prompt = (
             "你是 NextInAI 的报告解读 agent。"
-            "请基于给定来源内容，输出三行："
-            "factual_summary=... / interpreted_summary=... / is_partial=true|false。"
-            "事实摘要只能写可从来源直接确认的内容；解读分析单独写这条内容为什么值得 AI/agent 用户关注。"
+            "请基于给定来源内容，输出四行："
+            "headline_summary=... / factual_summary=... / interpreted_summary=... / is_partial=true|false。"
+            "事实摘要只能写可从来源直接确认的内容，且必须用一句中文直接说明这条内容讲了什么；"
+            "不要写“值得关注”“意味着”“这对用户很重要”这类评价话术；"
+            "headline_summary 必须像新闻短标题一样，只说内容本身，不要带来源前缀，不要带评论；"
+            "解读分析再单独补充背景、影响或判断。"
             f"\n来源：{source_name}\n标题：{title}\n链接：{url}\n内容：\n{content[:6000]}"
         )
         text = self._complete(prompt)
@@ -589,6 +608,7 @@ class OpenAIIntelligenceAgent(IntelligenceAgent):
             body_text=body_text,
         )
         return ReportInterpretation(
+            headline_summary=parsed.get("headline_summary") or fallback.headline_summary,
             factual_summary=parsed.get("factual_summary") or fallback.factual_summary,
             interpreted_summary=parsed.get("interpreted_summary") or fallback.interpreted_summary,
             evidence=[url, title],
